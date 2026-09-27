@@ -1,0 +1,92 @@
+# CI for alcore-auth (Repo C, identity-only Bun+Hono service).
+#
+# AlRepo-style CI adapted down to a single service (source conventions:
+# dang232/AlRepo `.github/workflows/ci.yml`): same `actions/checkout@v4`
+# + `oven-sh/setup-bun@v2` pins, same `permissions: contents: read`, same
+# gate order (typecheck -> test -> secret scan). Dropped as meaningless
+# here: turbo/monorepo steps, docker/compose, coverage gates,
+# release-manifest/schema-snapshot checks, compat matrix, image builds.
+#
+# Bun pin: 1.4.2 = the proven local runtime (`bun --version` on the dev
+# box) AND the AlRepo `ci.yml` pin. Keep in sync when either moves.
+#
+# Runner: `ubuntu-latest` (same image AlRepo uses for its release-image
+# jobs). AlRepo `ci.yml` runs on self-hosted `[self-hosted, alcore,
+# compat]` labels because that repo needs docker+Mongo and exhausted
+# GitHub-hosted minutes; this service needs neither, and those labels are
+# AlRepo-scoped (a job queued on them here would wait for a runner
+# forever), so GitHub-hosted is correct for this repo.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Tests
+        run: bun test
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Grep-based credential-format gate, ported from the AlRepo
+      # `scan-secrets.mjs` rule set at reduced scope (high-signal formats
+      # only). No third-party actions: checkout + stock grep only.
+      # Findings print `file:line` — never the matched secret value
+      # (`cut` drops the line content). Verified clean on the current
+      # tree; if a fixture ever trips it, allowlist by path, never by
+      # weakening the patterns globally.
+      - name: Secret scan (credential formats)
+        run: |
+          hits=$(grep -rEnI --exclude-dir=.git --exclude-dir=node_modules \
+            -e 'AKIA[0-9A-Z]{16}' \
+            -e 'gh[pousr]_[A-Za-z0-9]{36,}' \
+            -e 'sk_(live|test)_[A-Za-z0-9]{8,}' \
+            -e 'xox[baprs]-[A-Za-z0-9-]{10,}' \
+            -e 'AIza[0-9A-Za-z_-]{35}' \
+            -e 'BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----' \
+            . | cut -d: -f1,2) || true
+          if [ -n "$hits" ]; then
+            echo "SECRET_SCAN_FAILED:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "SECRET_SCAN_OK"
