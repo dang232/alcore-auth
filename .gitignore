@@ -1,2 +1,16 @@
 # deps
 node_modules/
+
+# build
+dist/
+
+# coverage
+coverage/
+
+# env (keep .env.example only — never commit real secrets)
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
