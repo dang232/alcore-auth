@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { authRoutes } from './routes/auth'
 import { oidcRoutes } from './routes/oidc'
 import { getAuthPort, getBindHost, getJwtSecret, nodeEnv } from './config'
+import { authReadiness } from './lib/readiness'
 
 export const app = new Hono()
 
@@ -12,6 +13,15 @@ app.get('/', (c) => {
 // ALcore wiring (identity-only Auth Repo C; generated boilerplate above untouched).
 app.get('/health', (c) => {
   return c.json({ ok: true, service: 'auth-service' })
+})
+// Task 26: readiness with real substrate checks (config + store + signer).
+// Same /health + /health/ready contract the staging runbook health-gates.
+app.get('/health/ready', (c) => {
+  const r = authReadiness()
+  const body = r.ready
+    ? { status: 'ok' as const, checks: r.checks }
+    : { status: 'unavailable' as const, checks: r.checks, reasons: r.reasons }
+  return c.json(body, r.ready ? 200 : 503)
 })
 app.route('/auth', authRoutes)
 app.route('/oidc', oidcRoutes)
