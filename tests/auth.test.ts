@@ -7,6 +7,7 @@ process.env["ALLOW_WEAK_JWT_SECRET"] = "1";
 process.env["NODE_ENV"] = "test";
 
 import { describe, test, expect } from "bun:test";
+import { join } from "node:path";
 import { app } from "../src/index";
 import { getJwtSecret } from "../src/config";
 import { mintPurposeToken } from "../src/lib/crypto";
@@ -185,8 +186,8 @@ describe("guards", () => {
   });
 
   test("prod boot without JWT_SECRET fails fast naming the variable", () => {
-    const proc = Bun.spawnSync(["bun", "src/index.ts"], {
-      cwd: "I:\\migration\\auth-service",
+    const proc = Bun.spawnSync([process.execPath, "src/index.ts"], {
+      cwd: join(import.meta.dir, ".."),
       env: {
         ...process.env,
         NODE_ENV: "production",
