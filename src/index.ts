@@ -1,10 +1,41 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { authRoutes } from './routes/auth'
 import { oidcRoutes } from './routes/oidc'
-import { getAuthPort, getBindHost, getJwtSecret, nodeEnv } from './config'
+import { getAuthPort, getBindHost, getJwtSecret, getAllowedOrigins, nodeEnv } from './config'
 import { authReadiness } from './lib/readiness'
 
 export const app = new Hono()
+
+// CORS FIRST, before ALL routes (incl. /health — CORS-harmless).
+// Exact-origin echo from the allowlist shared with the OIDC
+// redirect-uri check (src/routes/oidc.ts consumes getAllowedOrigins()
+// read-only; its semantics are untouched). Never `*` with credentials:
+// non-allowlisted origins get NO ACAO echo. Preflight short-circuits
+// here with 204, so OPTIONS never requires auth.
+// allowHeaders covers Authorization + Content-Type: no auth route reads
+// Idempotency-Key (only provision-hook docs mention it), so it is NOT
+// allowlisted — no cargo-cult headers.
+// Credential-scope guard: Hono's cors() emits Allow-Credentials whenever
+// credentials:true, even with no origin match. A grant without an ACAO echo
+// is spec-inert, but this service never sends one — strip it so credentials
+// are only ever allowed alongside an echoed allowlist origin.
+app.use('*', async (c, next) => {
+  await next()
+  if (!c.res.headers.has('access-control-allow-origin')) {
+    c.res.headers.delete('access-control-allow-credentials')
+  }
+})
+app.use(
+  '*',
+  cors({
+    origin: (origin) => (getAllowedOrigins().includes(origin) ? origin : null),
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Authorization', 'Content-Type'],
+    maxAge: 600,
+    credentials: true,
+  }),
+)
 
 app.get('/', (c) => {
   return c.text('Hello Hono!')

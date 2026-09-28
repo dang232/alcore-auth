@@ -1,0 +1,37 @@
+# ALcore Auth (Repo C) — VPS staging/prod compose.
+# Satisfies .omo/research/task26/vps-owner-runbook.md section 2:
+#   AUTH_PORT=8082 AUTH_HOST=127.0.0.1 AUTH_ISSUER=https://auth.alcore.io.vn \
+#     docker compose up -d --build
+#   curl -s http://127.0.0.1:8082/health
+#   curl -s http://127.0.0.1:8082/health/ready
+#
+# Env keys AUTH_PORT / AUTH_HOST / AUTH_ISSUER / JWT_SECRET match
+# src/config.ts reads exactly (getAuthPort/getBindHost/getIssuer/getJwtSecret).
+
+services:
+  auth:
+    build: .
+    # Host-local ONLY — edge ingress is Caddy's job (auth.${DOMAIN} -> 8082).
+    # Never 0.0.0.0 here.
+    ports:
+      - "127.0.0.1:8082:8082"
+    environment:
+      NODE_ENV: production
+      # Container-internal bind MUST be 0.0.0.0: 127.0.0.1 inside the
+      # container is the container's own loopback, unreachable via the
+      # published port. Host-local restriction is enforced by the
+      # 127.0.0.1 ports mapping above, not by this variable. The runbook's
+      # host-side AUTH_HOST export is therefore intentionally NOT forwarded.
+      AUTH_HOST: "0.0.0.0"
+      # Keep 8082 unless the ports mapping above is changed in lockstep.
+      AUTH_PORT: ${AUTH_PORT:-8082}
+      AUTH_ISSUER: ${AUTH_ISSUER:-https://auth.alcore.io.vn}
+      # Optional passthrough: empty -> code defaults (web + apex + localhost
+      # dev, src/config.ts). Production sets the explicit triangle
+      # (https://web.alcore.io.vn,https://alcore.io.vn,https://auth.alcore.io.vn).
+      AUTH_ALLOWED_ORIGINS: ${AUTH_ALLOWED_ORIGINS:-}
+      # REQUIRED-empty passthrough: forwarded from the owner's host env,
+      # never a value in this file. Prod boot without it exits 1 (fail-fast,
+      # src/config.ts) — that is the intended behavior, not a misconfig.
+      JWT_SECRET: ${JWT_SECRET:-}
+    restart: unless-stopped

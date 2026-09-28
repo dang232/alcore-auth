@@ -17,7 +17,7 @@ export const DEFAULT_BIND_HOST = "127.0.0.1";
 export const DEFAULT_ISSUER = "https://auth.alcore.io.vn";
 
 const DEFAULT_ALLOWED_ORIGINS: string[] = [
-  "https://app.alcore.io.vn",
+  "https://web.alcore.io.vn",
   "https://alcore.io.vn",
   "http://localhost:3000",
   "http://localhost:8081",

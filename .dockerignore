@@ -1,0 +1,11 @@
+# Keep the production image to the runtime tree only.
+# (Dockerfile already COPYs just package.json/bun.lock + src; this is the
+# belt-and-suspenders layer so stray files never sneak in via context.)
+node_modules
+dist
+.env*
+*.log
+tests
+coverage
+.git
+.github
