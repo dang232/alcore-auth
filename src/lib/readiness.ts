@@ -42,8 +42,8 @@ export function probeIdentitySubstrate(): boolean {
 }
 
 export function roundTripSigner(secret: string, issuer: string): boolean {
-  const token = signAccess({ sub: "__probe__", sid: "__probe__", iss: issuer }, secret, 60);
-  const payload = verifyAccess(token, secret, issuer);
+  const token = signAccess({ sub: "__probe__", sid: "__probe__", iss: issuer, aud: "auth", intent: "session" }, secret, 60);
+  const payload = verifyAccess(token, secret, issuer, "auth", "session");
   return payload.sub === "__probe__" && payload.iss === issuer;
 }
 

@@ -77,13 +77,13 @@ describe("GET /health/ready", () => {
         "https://auth.alcore.io.vn",
       ),
     ).toBe(true);
-    const token = signAccess(
-      { sub: "u", sid: "s", iss: "https://auth.alcore.io.vn" },
+      const token = signAccess(
+      { sub: "u", sid: "s", iss: "https://auth.alcore.io.vn", aud: "auth", intent: "session" },
       "test-only-dummy-secret-0123456789abcdef",
       60,
     );
     expect(() =>
-      verifyAccess(token, "wrong-secret-0123456789abcdefghij", "https://auth.alcore.io.vn"),
+      verifyAccess(token, "wrong-secret-0123456789abcdefghij", "https://auth.alcore.io.vn", "auth"),
     ).toThrow();
   });
 
