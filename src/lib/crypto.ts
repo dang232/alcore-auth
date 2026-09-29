@@ -34,11 +34,22 @@ export function hmacHex(secret: string, payload: string): string {
 // --- HS256 access tokens (short-lived, identity-only) ---
 
 export interface AccessPayload {
-  sub: string;
-  sid: string;
-  iss: string;
-  exp: number;
+  readonly sub: string;
+  readonly sid: string;
+  readonly iss: string;
+  readonly aud: string;
+  readonly exp: number;
+  readonly intent: string;
 }
+
+type ParsedAccessPayload = {
+  readonly sub: string;
+  readonly sid: string;
+  readonly iss: string;
+  readonly aud: string;
+  readonly exp: number;
+  readonly intent: string;
+};
 
 export const JWT_ALG = "HS256";
 export const JWT_TYP = "JWT";
@@ -75,7 +86,7 @@ function signData(data: string, secret: string): string {
 }
 
 export function signAccess(
-  claims: { sub: string; sid: string; iss: string },
+  claims: Pick<AccessPayload, "sub" | "sid" | "iss" | "aud" | "intent">,
   secret: string,
   ttlSeconds: number,
 ): string {
@@ -88,10 +99,11 @@ export function signAccess(
 
 export class JwtError extends Error {}
 
-export function verifyAccess(token: string, secret: string, expectedIss: string): AccessPayload {
+export function verifyAccess(token: string, secret: string, expectedIss: string, expectedAud: string, expectedIntent?: string): AccessPayload {
   const parts = token.split(".");
   if (parts.length !== 3) throw new JwtError("malformed jwt");
-  const [headerEnc, payloadEnc, sig] = parts as [string, string, string];
+  const [headerEnc, payloadEnc, sig] = parts;
+  if (headerEnc === undefined || payloadEnc === undefined || sig === undefined) throw new JwtError("malformed jwt");
   const expected = signData(`${headerEnc}.${payloadEnc}`, secret);
   const a = b64UrlDecodeBytes(sig);
   const b = b64UrlDecodeBytes(expected);
@@ -104,25 +116,35 @@ export function verifyAccess(token: string, secret: string, expectedIss: string)
   } catch {
     throw new JwtError("malformed jwt");
   }
-  if (typeof header !== "object" || header === null || (header as { alg?: unknown }).alg !== JWT_ALG) {
+  if (typeof header !== "object" || header === null || !("alg" in header) || header.alg !== JWT_ALG) {
     throw new JwtError("unsupported alg");
   }
-  const p = payload as Partial<AccessPayload>;
+  if (typeof payload !== "object" || payload === null) throw new JwtError("malformed payload");
+  const p = Object.fromEntries(Object.entries(payload));
   if (
-    typeof p !== "object" ||
-    p === null ||
     typeof p.sub !== "string" ||
     p.sub === "" ||
     typeof p.sid !== "string" ||
     p.sid === "" ||
     typeof p.iss !== "string" ||
     p.iss !== expectedIss ||
-    typeof p.exp !== "number"
+    typeof p.aud !== "string" ||
+    p.aud !== expectedAud ||
+    typeof p.exp !== "number" ||
+    typeof p.intent !== "string" ||
+    (expectedIntent !== undefined && p.intent !== expectedIntent)
   ) {
     throw new JwtError("malformed payload");
   }
   if (p.exp <= Math.floor(Date.now() / 1000)) throw new JwtError("expired");
-  return p as AccessPayload;
+  return {
+    sub: p.sub,
+    sid: p.sid,
+    iss: p.iss,
+    aud: p.aud,
+    exp: p.exp,
+    intent: p.intent,
+  } satisfies ParsedAccessPayload;
 }
 
 // --- Stateless single-purpose tokens (verify / reset), HMAC-signed ---

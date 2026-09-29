@@ -6,7 +6,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { setCookie, deleteCookie, getCookie } from "hono/cookie";
-import { getJwtSecret, getIssuer } from "../config";
+import { getGoogleClientId, getGoogleRedirectUri, getJwtSecret, getIssuer } from "../config";
 import {
   hashPassword,
   verifyPassword,
@@ -19,7 +19,8 @@ import {
   JwtError,
   TokenError,
 } from "../lib/crypto";
-import { userStore, sessionStore } from "../lib/store";
+import { googleStateStore, userStore, sessionStore } from "../lib/store";
+import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential } from "../lib/google";
 import type { Session } from "../lib/store";
 import { authRateLimit } from "../lib/ratelimit";
 
@@ -81,8 +82,9 @@ export interface TokenPair {
 function issuePair(userId: string): { pair: TokenPair; session: Session } {
   const secret = getJwtSecret();
   const refresh = randomToken(32);
-  const session = sessionStore.create(userId, hashToken(refresh), REFRESH_TTL_MS);
-  const access = signAccess({ sub: userId, sid: session.id, iss: getIssuer() }, secret, ACCESS_TTL_SECONDS);
+  const sessionId = crypto.randomUUID();
+  const access = signAccess({ sub: userId, sid: sessionId, iss: getIssuer(), aud: "auth", intent: "session" }, secret, ACCESS_TTL_SECONDS);
+  const session = sessionStore.createWithId(sessionId, userId, hashToken(refresh), REFRESH_TTL_MS);
   return {
     session,
     pair: { access_token: access, refresh_token: refresh, token_type: "Bearer", expires_in: ACCESS_TTL_SECONDS },
@@ -124,7 +126,9 @@ authRoutes.post("/register", async (c) => {
     return c.json({ error: "email_taken" }, 409);
   }
   const user = userStore.create(email, await hashPassword(password));
-  return c.json({ id: user.id, email: user.email, emailVerified: user.emailVerified }, 201);
+  const { pair } = issuePair(user.id);
+  setAuthCookies(c, pair);
+  return c.json({ id: user.id, email: user.email, emailVerified: user.emailVerified, ...pair }, 201);
 });
 
 // POST /auth/login — identical 401 shape for unknown email vs bad password.
@@ -166,7 +170,7 @@ authRoutes.post("/refresh", async (c) => {
   sessionStore.rotate(session, hashToken(next));
   const secret = getJwtSecret();
   const access = signAccess(
-    { sub: session.userId, sid: session.id, iss: getIssuer() },
+    { sub: session.userId, sid: session.id, iss: getIssuer(), aud: "auth", intent: "session" },
     secret,
     ACCESS_TTL_SECONDS,
   );
@@ -193,7 +197,7 @@ authRoutes.post("/logout", async (c) => {
   const token = bearer(c);
   if (token === "") return c.json({ error: "unauthorized" }, 401);
   try {
-    const payload = verifyAccess(token, getJwtSecret(), getIssuer());
+    const payload = verifyAccess(token, getJwtSecret(), getIssuer(), "auth", "session");
     const s = sessionStore.findById(payload.sid);
     if (s !== undefined) sessionStore.revoke(s);
   } catch (e) {
@@ -209,7 +213,7 @@ authRoutes.get("/me", async (c) => {
   const token = bearer(c);
   if (token === "") return c.json({ error: "unauthorized" }, 401);
   try {
-    const payload = verifyAccess(token, getJwtSecret(), getIssuer());
+    const payload = verifyAccess(token, getJwtSecret(), getIssuer(), "auth", "session");
     const view = userView(payload.sub);
     if (view === null) return c.json({ error: "unauthorized" }, 401);
     return c.json(view);
@@ -277,29 +281,90 @@ authRoutes.post("/reset/consume", async (c) => {
   }
 });
 
-// GET /auth/google/callback — verified-sub STUB.
-// Prod MUST verify Google ID tokens server-side; this stub trusts `sub`
-// (+ `email`) query params so the link/no-dupe contract is provable without
-// live Google. Same (provider, sub) always returns the SAME user id.
+authRoutes.get("/google/start", (c) => {
+  const clientId = getGoogleClientId();
+  if (clientId === "") return c.json({ error: "google_not_configured" }, 503);
+  const state = randomToken(24);
+  const nonce = randomToken(24);
+  googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.search = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: getGoogleRedirectUri(),
+    response_type: "code",
+    scope: "openid email profile",
+    state,
+    nonce,
+    prompt: "select_account",
+  }).toString();
+  setCookie(c, "alcore_google_state", state, {
+    httpOnly: true, secure: true, sameSite: "Lax", path: "/auth/google/callback", maxAge: 300,
+  });
+  return c.redirect(url.toString(), 302);
+});
+
 authRoutes.get("/google/callback", async (c) => {
   if (limited(c, "google")) return c.json({ error: "rate_limited" }, 429);
-  const sub = (c.req.query("sub") ?? "").trim();
-  const email = (c.req.query("email") ?? "").trim().toLowerCase();
-  if (sub === "") return c.json({ error: "missing_sub" }, 400);
-  const existing = userStore.findByProviderSub("google", sub);
-  if (existing !== undefined) {
-    const { pair } = issuePair(existing.id);
-    setAuthCookies(c, pair);
-    c.header("x-auth-reused", "true");
-    return c.json({ ...pair, user: { id: existing.id, email: existing.email } });
+  if (c.req.query("error") !== undefined) return c.json({ error: "google_oauth_error" }, 400);
+  const state = c.req.query("state") ?? "";
+  const code = c.req.query("code") ?? "";
+  const expectedState = getCookie(c, "alcore_google_state") ?? "";
+  if (state === "" || code === "" || state !== expectedState) {
+    deleteCookie(c, "alcore_google_state", { path: "/auth/google/callback" });
+    return c.json({ error: "invalid_google_state" }, 400);
   }
-  // Verified-email match links to the existing password user (link-row).
-  const byEmail = EMAIL_RE.test(email) ? userStore.findByEmail(email) : undefined;
-  const target = byEmail ?? userStore.create(EMAIL_RE.test(email) ? email : `google-${sub}@stub.local`, null);
-  if (byEmail === undefined) userStore.setVerified(target.id);
-  else userStore.setVerified(target.id);
-  userStore.linkIdentity(target.id, "google", sub);
-  const { pair } = issuePair(target.id);
+  const transaction = googleStateStore.consume(state);
+  deleteCookie(c, "alcore_google_state", { path: "/auth/google/callback" });
+  if (transaction === null) return c.json({ error: "invalid_google_state" }, 400);
+  const clientId = getGoogleClientId();
+  const clientSecret = (process.env["GOOGLE_CLIENT_SECRET"] ?? "").trim();
+  if (clientId === "" || clientSecret === "") return c.json({ error: "google_not_configured" }, 503);
+  let tokenResponse: Response;
+  try {
+    tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: getGoogleRedirectUri(),
+      grant_type: "authorization_code",
+    }),
+    signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    return c.json({ error: "upstream_unavailable" }, 503);
+  }
+  if (!tokenResponse.ok) return c.json({ error: "invalid_google_credential" }, 401);
+  let tokenBody: unknown;
+  try {
+    tokenBody = await tokenResponse.json();
+  } catch {
+    return c.json({ error: "upstream_unavailable" }, 503);
+  }
+  if (typeof tokenBody !== "object" || tokenBody === null || typeof (tokenBody as Record<string, unknown>)["id_token"] !== "string") return c.json({ error: "invalid_google_credential" }, 401);
+  let profile;
+  try {
+    profile = await verifyGoogleCredential(
+      String((tokenBody as Record<string, unknown>)["id_token"]),
+      transaction.nonce,
+    );
+  } catch (error) {
+    if (error instanceof GoogleCredentialError) return c.json({ error: "invalid_google_credential" }, 401);
+    if (error instanceof GoogleUpstreamError) return c.json({ error: "upstream_unavailable" }, 503);
+    throw error;
+  }
+  const existing = userStore.findByProviderSub("google", profile.subject);
+  const emailUser = userStore.findByEmail(profile.email);
+  if (existing !== undefined && emailUser !== undefined && existing.id !== emailUser.id) {
+    return c.json({ error: "identity_conflict" }, 409);
+  }
+  const user = existing ?? emailUser ?? userStore.create(profile.email, null);
+  userStore.setVerified(user.id);
+  const linkResult = userStore.linkIdentity(user.id, "google", profile.subject);
+  if (linkResult === "owned_by_other_user") return c.json({ error: "identity_conflict" }, 409);
+  const { pair } = issuePair(user.id);
   setAuthCookies(c, pair);
-  return c.json({ ...pair, user: { id: target.id, email: target.email } });
+  return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true } });
 });

@@ -10,9 +10,10 @@ import { describe, test, expect } from "bun:test";
 import { join } from "node:path";
 import { app } from "../src/index";
 import { getJwtSecret } from "../src/config";
-import { mintPurposeToken } from "../src/lib/crypto";
+import { mintPurposeToken, signAccess, verifyAccess } from "../src/lib/crypto";
 import { createRateLimiter } from "../src/lib/ratelimit";
-import { resetStoresForTests } from "../src/lib/store";
+import { googleStateStore, resetStoresForTests, userStore } from "../src/lib/store";
+import { getIssuer } from "../src/config";
 
 resetStoresForTests();
 
@@ -121,37 +122,168 @@ describe("verify + reset (no enumeration)", () => {
   });
 });
 
-describe("google link (verified-sub STUB)", () => {
-  test("same Google sub never dupes; second login returns same id with x-auth-reused", async () => {
-    const g1 = await app.request("/auth/google/callback?sub=google-sub-1&email=gina@example.com");
-    expect(g1.status).toBe(200);
-    const b1 = (await g1.json()) as { user: { id: string } };
-    const g2 = await app.request("/auth/google/callback?sub=google-sub-1&email=gina@example.com");
-    expect(g2.status).toBe(200);
-    const b2 = (await g2.json()) as { user: { id: string } };
-    expect(b2.user.id).toBe(b1.user.id);
-    expect(g2.headers.get("x-auth-reused")).toBe("true");
-    expect(g1.headers.get("x-auth-reused")).toBeNull();
+describe("Google OAuth", () => {
+  test("callback rejects caller-supplied identity fields without valid state", async () => {
+    const res = await app.request("/auth/google/callback?sub=google-sub-1&email=gina@example.com");
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "invalid_google_state" });
   });
 
-  test("verified-email match links to the existing password user", async () => {
-    const reg = await post("/auth/register", { email: "hank@example.com", password: "s3cret-pass" });
-    const created = (await reg.json()) as { id: string };
-    const g = await app.request("/auth/google/callback?sub=google-sub-2&email=hank@example.com");
-    expect(g.status).toBe(200);
-    const body = (await g.json()) as { user: { id: string } };
-    expect(body.user.id).toBe(created.id);
+  test("start redirects to Google and sets short-lived state cookie", async () => {
+    const oldClientId = process.env["GOOGLE_CLIENT_ID"];
+    try {
+      process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
+      const res = await app.request("/auth/google/start");
+      expect(res.status).toBe(302);
+      const target = new URL(res.headers.get("location") ?? "https://invalid");
+      expect(target.origin).toBe("https://accounts.google.com");
+      expect(target.searchParams.get("client_id")).toBe(process.env["GOOGLE_CLIENT_ID"]);
+      expect(target.searchParams.get("state")).not.toBe("");
+      expect(target.searchParams.get("nonce")).not.toBe("");
+      expect(res.headers.getSetCookie().some((cookie) => cookie.startsWith("alcore_google_state=") && cookie.includes("HttpOnly") && cookie.includes("Secure"))).toBe(true);
+    } finally {
+      if (oldClientId === undefined) delete process.env["GOOGLE_CLIENT_ID"];
+      else process.env["GOOGLE_CLIENT_ID"] = oldClientId;
+    }
+  });
+
+  async function callbackWithFetch(
+    responder: (nonce: string) => typeof globalThis.fetch,
+    callback: (state: string, nonce: string) => Promise<Response>,
+  ): Promise<Response> {
+    const originalFetch = globalThis.fetch;
+    const oldClientId = process.env["GOOGLE_CLIENT_ID"];
+    const oldClientSecret = process.env["GOOGLE_CLIENT_SECRET"];
+    process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
+    process.env["GOOGLE_CLIENT_SECRET"] = "test-client-secret";
+    const state = `state-${crypto.randomUUID()}`;
+    const nonce = `nonce-${crypto.randomUUID()}`;
+    try {
+      globalThis.fetch = responder(nonce);
+      googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+      return await callback(state, nonce);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (oldClientId === undefined) delete process.env["GOOGLE_CLIENT_ID"];
+      else process.env["GOOGLE_CLIENT_ID"] = oldClientId;
+      if (oldClientSecret === undefined) delete process.env["GOOGLE_CLIENT_SECRET"];
+      else process.env["GOOGLE_CLIENT_SECRET"] = oldClientSecret;
+    }
+  }
+
+  function response(status: number, body: unknown): Response {
+    return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  }
+
+  function mockFetch(handler: (input: RequestInfo | URL) => Promise<Response>): typeof globalThis.fetch {
+    return Object.assign(handler, { preconnect: globalThis.fetch.preconnect });
+  }
+
+  function successfulGoogleFetch(nonce: string): typeof globalThis.fetch {
+    return mockFetch(async (input) => {
+      if (String(input).includes("/tokeninfo?")) {
+        return response(200, {
+          aud: "test-client.apps.googleusercontent.com",
+          iss: "https://accounts.google.com",
+          nonce,
+          exp: String(Math.floor(Date.now() / 1000) + 300),
+          sub: "google-user-1",
+          email: "google@example.com",
+          email_verified: true,
+        });
+      }
+      return response(200, { id_token: "test-id-token" });
+    });
+  }
+
+  async function performCallback(state: string, withCookie = true): Promise<Response> {
+    const cookie = withCookie ? `alcore_google_state=${state}` : "";
+    return app.request(`/auth/google/callback?state=${encodeURIComponent(state)}&code=test-code`, {
+      headers: { cookie },
+    });
+  }
+
+  test("valid Google callback creates user, identity, and session", async () => {
+    const res = await callbackWithFetch(
+      (nonce) => successfulGoogleFetch(nonce),
+      async (state) => performCallback(state),
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).user.email).toBe("google@example.com");
+  });
+
+  test("verified Google email links to existing user", async () => {
+    const user = userStore.create("link@example.com", "password-hash");
+    const res = await callbackWithFetch((nonce) => mockFetch(async (input) => {
+      if (String(input).includes("/tokeninfo?")) return response(200, {
+        aud: "test-client.apps.googleusercontent.com", iss: "accounts.google.com", nonce,
+        exp: String(Math.floor(Date.now() / 1000) + 300), sub: "google-linked", email: "link@example.com", email_verified: true,
+      });
+      return response(200, { id_token: "test-id-token" });
+    }), async (state) => performCallback(state));
+    expect(res.status).toBe(200);
+    expect((await res.json()).user.id).toBe(user.id);
+  });
+
+  test("callback returns 409 when Google identity belongs to another user", async () => {
+    const owner = userStore.create("owner@example.com", null);
+    const another = userStore.create("other@example.com", null);
+    userStore.linkIdentity(owner.id, "google", "google-conflict");
+    const res = await callbackWithFetch((nonce) => mockFetch(async (input) => {
+      if (String(input).includes("/tokeninfo?")) return response(200, {
+        aud: "test-client.apps.googleusercontent.com", iss: "accounts.google.com", nonce,
+        exp: String(Math.floor(Date.now() / 1000) + 300), sub: "google-conflict", email: another.email, email_verified: true,
+      });
+      return response(200, { id_token: "test-id-token" });
+    }), async (state) => performCallback(state));
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "identity_conflict" });
+  });
+
+  test("callback rejects replayed or invalid state", async () => {
+    const res = await callbackWithFetch(() => mockFetch(async () => response(200, { id_token: "x" })), async (validState) => {
+      await performCallback(validState);
+      return performCallback(validState);
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("callback maps Google upstream failures to 503", async () => {
+    const res = await callbackWithFetch(() => mockFetch(async () => { throw new Error("network down"); }), async (state) => performCallback(state));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "upstream_unavailable" });
+  });
+
+  test("callback keeps invalid Google credentials at 401", async () => {
+    const res = await callbackWithFetch(() => mockFetch(async () => response(401, {})), async (state) => performCallback(state));
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "invalid_google_credential" });
   });
 });
 
 describe("OIDC code flow", () => {
+  const redirectUri = "http://localhost:3000/callback";
+  const clientId = "test-client";
+
+  async function getSessionToken(email: string): Promise<string> {
+    await post("/auth/register", { email, password: "s3cret-pass" });
+    const login = await post("/auth/login", { email, password: "s3cret-pass" });
+    const body: unknown = await login.json();
+    if (typeof body !== "object" || body === null || !("access_token" in body) || typeof body.access_token !== "string") {
+      throw new Error("login did not return an access token");
+    }
+    return body.access_token;
+  }
+
+  function configureOidc(): void {
+    process.env["AUTH_OIDC_CLIENTS"] = `${clientId}=${redirectUri}`;
+  }
+
   test("authorize -> code -> server-side exchange; replay -> 400; no JWT in URL", async () => {
-    await post("/auth/register", { email: "ivan@example.com", password: "s3cret-pass" });
-    const login = await post("/auth/login", { email: "ivan@example.com", password: "s3cret-pass" });
-    const { access_token } = (await login.json()) as { access_token: string };
-    const redirectUri = "http://localhost:3000/callback";
+    configureOidc();
+    const access_token = await getSessionToken("ivan@example.com");
     const auth = await app.request(
-      `/oidc/authorize?response_type=code&client_id=stub&redirect_uri=${encodeURIComponent(redirectUri)}&state=s123`,
+      `/oidc/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=s123`,
       { headers: { authorization: `Bearer ${access_token}` } },
     );
     expect(auth.status).toBe(302);
@@ -161,19 +293,71 @@ describe("OIDC code flow", () => {
     expect(location).not.toContain("eyJ");
     const code = new URL(location).searchParams.get("code") ?? "";
     expect(code.length).toBeGreaterThan(0);
+    expect(location).not.toContain("access_token");
+    expect(location).not.toContain("refresh_token");
     const t1 = await post("/oidc/token", {
       grant_type: "authorization_code",
       code,
       redirect_uri: redirectUri,
+      client_id: clientId,
     });
     expect(t1.status).toBe(200);
     const replay = await post("/oidc/token", {
       grant_type: "authorization_code",
       code,
       redirect_uri: redirectUri,
+      client_id: clientId,
     });
     expect(replay.status).toBe(400);
     expect(await replay.json()).toEqual({ error: "invalid_grant" });
+  });
+
+  test("authorize rejects unregistered clients and URI mismatch", async () => {
+    configureOidc();
+    const token = await getSessionToken("oidc-unknown@example.com");
+    const unknown = await app.request(`/oidc/authorize?response_type=code&client_id=unknown&redirect_uri=${encodeURIComponent(redirectUri)}`, { headers: { authorization: `Bearer ${token}` } });
+    const mismatch = await app.request(`/oidc/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(`${redirectUri}/evil`)}`, { headers: { authorization: `Bearer ${token}` } });
+    expect(unknown.status).toBe(400);
+    expect(mismatch.status).toBe(400);
+  });
+
+  test("OIDC code remains bound to the client that requested it", async () => {
+    configureOidc();
+    process.env["AUTH_OIDC_CLIENTS"] += ",other-client=http://localhost:3000/other";
+    const token = await getSessionToken("oidc-binding@example.com");
+    const auth = await app.request(`/oidc/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}`, { headers: { authorization: `Bearer ${token}` } });
+    const code = new URL(auth.headers.get("location") ?? "https://invalid").searchParams.get("code") ?? "";
+    const exchange = await post("/oidc/token", { grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/other", client_id: "other-client" });
+    expect(exchange.status).toBe(400);
+  });
+
+  test("product exchange issues aud+intent assertion, rejects wrong intent, and consumes code once", async () => {
+    const token = await getSessionToken("exchange@example.com");
+    const wrongIntent = await post("/oidc/exchange", { audience: "tokenpanel", intent: "other" }, { authorization: `Bearer ${token}` });
+    expect(wrongIntent.status).toBe(400);
+    const invalidIntentExchange = await post("/oidc/exchange/token", { code: "unissued", audience: "tokenpanel", intent: "other" });
+    expect(invalidIntentExchange.status).toBe(400);
+    const issued = await post("/oidc/exchange", { audience: "tokenpanel", intent: "product_exchange" }, { authorization: `Bearer ${token}` });
+    expect(issued.status).toBe(200);
+    const issuedBody: unknown = await issued.json();
+    if (typeof issuedBody !== "object" || issuedBody === null || !("code" in issuedBody) || typeof issuedBody.code !== "string") {
+      throw new Error("exchange did not return a code");
+    }
+    const code = issuedBody.code;
+    expect(code).not.toContain(".");
+    const exchanged = await post("/oidc/exchange/token", { code, audience: "tokenpanel", intent: "product_exchange" });
+    expect(exchanged.status).toBe(200);
+    const exchangedBody: unknown = await exchanged.json();
+    if (typeof exchangedBody !== "object" || exchangedBody === null || !("access_token" in exchangedBody) || typeof exchangedBody.access_token !== "string") {
+      throw new Error("exchange did not return an assertion");
+    }
+    const assertion = exchangedBody.access_token;
+    const claims = verifyAccess(assertion, getJwtSecret(), getIssuer(), "tokenpanel", "product_exchange");
+    expect(claims.sub).toBe(userStore.findByEmail("exchange@example.com")?.id ?? "");
+    expect(claims.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
+    expect(() => verifyAccess(assertion, getJwtSecret(), getIssuer(), "libre")).toThrow();
+    const replay = await post("/oidc/exchange/token", { code, audience: "tokenpanel", intent: "product_exchange" });
+    expect(replay.status).toBe(400);
   });
 });
 

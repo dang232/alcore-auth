@@ -51,9 +51,25 @@ calls out) for customer provision/backfill/link.
 | GET | `/auth/google/callback` | **STUB**: verified-sub only — production MUST verify Google ID tokens server-side |
 | GET | `/oidc/authorize` | authorization-code, 60 s single-use codes |
 | POST | `/oidc/token` | code exchange server-side; PKCE S256 optional |
+| POST | `/oidc/exchange` | authenticated request for a short-lived product exchange code |
+| POST | `/oidc/exchange/token` | consumes that code once and returns a product-scoped assertion |
 
-`redirect_uri` origin allowlist = web + apex + localhost dev defaults
-(env-overridable via `AUTH_ALLOWED_ORIGINS`).
+Configure OIDC clients with `AUTH_OIDC_CLIENTS=client_id=https://exact/callback`
+(comma-separated entries); both `client_id` and exact `redirect_uri` must match.
+`AUTH_ALLOWED_ORIGINS` remains an additional origin-level restriction.
+
+Product exchange: the authenticated caller requests `audience` (`tokenpanel` or
+`libre`) and `intent` (`product_exchange`). The returned opaque code expires in
+60 seconds and is single-use. Exchange it server-side at `/oidc/exchange/token`
+to receive a short-lived JWT. Consumers must verify signature and `iss` against
+the configured Auth issuer, exact expected `aud`, `sub` as the opaque Auth user
+id, future `exp`, and `intent === product_exchange`; reject expired or replayed
+exchange codes. Never place JWTs in URLs.
+
+`/oidc/token` takes `grant_type`, `code`, `client_id`, and exact registered
+`redirect_uri` in the request body. It returns a short-lived access assertion
+for that client; clients must validate signature, issuer, client audience,
+subject, expiry, and `intent === oidc`.
 
 ## Run / test
 

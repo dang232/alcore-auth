@@ -14,6 +14,12 @@ export function nodeEnv(): NodeEnv {
 export const MIN_JWT_SECRET_LEN = 32;
 export const DEFAULT_AUTH_PORT = 8082;
 export const DEFAULT_BIND_HOST = "127.0.0.1";
+export const DEFAULT_AUTH_DATABASE_PATH = "./data/auth.sqlite";
+
+export function getAuthDatabasePath(): string {
+  if (nodeEnv() === "test") return ":memory:";
+  return (process.env["AUTH_DATABASE_PATH"] ?? DEFAULT_AUTH_DATABASE_PATH).trim();
+}
 export const DEFAULT_ISSUER = "https://auth.alcore.io.vn";
 
 const DEFAULT_ALLOWED_ORIGINS: string[] = [
@@ -22,6 +28,26 @@ const DEFAULT_ALLOWED_ORIGINS: string[] = [
   "http://localhost:3000",
   "http://localhost:8081",
 ];
+
+export function getGoogleClientId(): string {
+  return (process.env["GOOGLE_CLIENT_ID"] ?? "").trim();
+}
+
+export function getGoogleRedirectUri(): string {
+  return (process.env["GOOGLE_REDIRECT_URI"] ?? `${getIssuer()}/auth/google/callback`).trim();
+}
+
+export function getProvisionConfig(): Readonly<{
+  readonly url: string;
+  readonly key: string;
+  readonly organizationId: string;
+}> {
+  return {
+    url: (process.env["TOKENPANEL_PROVISION_URL"] ?? "").trim().replace(/\/+$/, ""),
+    key: (process.env["TOKENPANEL_PROVISION_KEY"] ?? "").trim(),
+    organizationId: (process.env["TOKENPANEL_ORGANIZATION_ID"] ?? "").trim(),
+  };
+}
 
 const SAMPLE_SECRETS = new Set([
   "changeme",
@@ -110,4 +136,14 @@ export function getAllowedOrigins(): string[] {
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s !== "");
+}
+
+export function getOidcClients(): ReadonlyMap<string, string> {
+  const raw = process.env["AUTH_OIDC_CLIENTS"] ?? "";
+  return new Map(raw.split(",").flatMap((entry) => {
+    const separator = entry.indexOf("=");
+    const clientId = entry.slice(0, separator).trim();
+    const redirectUri = entry.slice(separator + 1).trim();
+    return separator > 0 && redirectUri !== "" ? [[clientId, redirectUri]] : [];
+  }));
 }
