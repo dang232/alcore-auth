@@ -123,6 +123,63 @@ describe("verify + reset (no enumeration)", () => {
 });
 
 describe("Google OAuth", () => {
+  test("public config exposes an empty client id and verify fails closed without configuration", async () => {
+    delete process.env["GOOGLE_CLIENT_ID"];
+    const config = await app.request("/auth/google/config");
+    expect(await config.json()).toEqual({ clientId: "" });
+    const verify = await post("/auth/google/verify", { idToken: "placeholder" });
+    expect(verify.status).toBe(503);
+    expect(await verify.json()).toEqual({ error: "google_not_configured" });
+  });
+
+  test("verify rejects oversized ID tokens", async () => {
+    process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
+    const res = await post("/auth/google/verify", { idToken: "x".repeat(8193) });
+    expect(res.status).toBe(401);
+  });
+
+  test("verify creates or links a user and issues a session", async () => {
+    const originalFetch = globalThis.fetch;
+    const oldClientId = process.env["GOOGLE_CLIENT_ID"];
+    process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
+    globalThis.fetch = mockFetch(async () => response(200, {
+      aud: "test-client.apps.googleusercontent.com", iss: "accounts.google.com",
+      exp: String(Math.floor(Date.now() / 1000) + 300), sub: "google-verify-sub",
+      email: "google-verify@example.com", email_verified: true,
+    }));
+    try {
+      const res = await post("/auth/google/verify", { idToken: "mock-id-token" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { access_token: string };
+      const user = userStore.findByEmail("google-verify@example.com");
+      expect(user).toBeDefined();
+      expect(verifyAccess(body.access_token, getJwtSecret(), getIssuer(), "auth", "session").sub)
+        .toBe(user === undefined ? "missing-user" : user.id);
+      const linkedUser = userStore.findByProviderSub("google", "google-verify-sub");
+      expect(linkedUser?.id).toBe(user?.id);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (oldClientId === undefined) delete process.env["GOOGLE_CLIENT_ID"];
+      else process.env["GOOGLE_CLIENT_ID"] = oldClientId;
+    }
+  });
+
+  test("verify maps upstream failures to 502", async () => {
+    const originalFetch = globalThis.fetch;
+    const oldClientId = process.env["GOOGLE_CLIENT_ID"];
+    process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
+    globalThis.fetch = mockFetch(async () => { throw new Error("network down"); });
+    try {
+      const res = await post("/auth/google/verify", { idToken: "mock-id-token" });
+      expect(res.status).toBe(502);
+      expect(await res.json()).toEqual({ error: "upstream_unavailable" });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (oldClientId === undefined) delete process.env["GOOGLE_CLIENT_ID"];
+      else process.env["GOOGLE_CLIENT_ID"] = oldClientId;
+    }
+  });
+
   test("callback rejects caller-supplied identity fields without valid state", async () => {
     const res = await app.request("/auth/google/callback?sub=google-sub-1&email=gina@example.com");
     expect(res.status).toBe(400);

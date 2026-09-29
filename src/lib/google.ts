@@ -21,7 +21,7 @@ export class GoogleUpstreamError extends Error {
 
 export async function verifyGoogleCredential(
   idToken: string,
-  expectedNonce: string,
+  expectedNonce: string | undefined = undefined,
 ): Promise<VerifiedGoogleProfile> {
   const audience = getGoogleClientId();
   if (audience === "") throw new GoogleCredentialError();
@@ -50,7 +50,7 @@ export async function verifyGoogleCredential(
   if (
     record["aud"] !== audience ||
     (issuer !== "accounts.google.com" && issuer !== "https://accounts.google.com") ||
-    record["nonce"] !== expectedNonce ||
+    (expectedNonce !== undefined && record["nonce"] !== expectedNonce) ||
     !Number.isFinite(exp) || exp * 1000 <= Date.now() ||
     typeof record["sub"] !== "string" || record["sub"].length === 0 ||
     typeof record["email"] !== "string" || record["email"].length === 0 ||

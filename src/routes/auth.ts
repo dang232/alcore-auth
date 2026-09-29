@@ -281,6 +281,39 @@ authRoutes.post("/reset/consume", async (c) => {
   }
 });
 
+authRoutes.get("/google/config", (c) => c.json({ clientId: getGoogleClientId() }));
+
+authRoutes.post("/google/verify", async (c) => {
+  if (limited(c, "google-verify")) return c.json({ error: "rate_limited" }, 429);
+  const body = await readJson(c);
+  const idToken = str(body?.["idToken"]);
+  if (idToken === "" || new TextEncoder().encode(idToken).byteLength > 8192) {
+    return c.json(INVALID_CREDENTIALS, 401);
+  }
+  if (getGoogleClientId() === "") return c.json({ error: "google_not_configured" }, 503);
+  let profile;
+  try {
+    profile = await verifyGoogleCredential(idToken);
+  } catch (error) {
+    if (error instanceof GoogleCredentialError) return c.json(INVALID_CREDENTIALS, 401);
+    if (error instanceof GoogleUpstreamError) return c.json({ error: "upstream_unavailable" }, 502);
+    throw error;
+  }
+  const existing = userStore.findByProviderSub("google", profile.subject);
+  const emailUser = userStore.findByEmail(profile.email);
+  if (existing !== undefined && emailUser !== undefined && existing.id !== emailUser.id) {
+    return c.json({ error: "identity_conflict" }, 409);
+  }
+  const user = existing ?? emailUser ?? userStore.create(profile.email, null);
+  userStore.setVerified(user.id);
+  if (userStore.linkIdentity(user.id, "google", profile.subject) === "owned_by_other_user") {
+    return c.json({ error: "identity_conflict" }, 409);
+  }
+  const { pair } = issuePair(user.id);
+  setAuthCookies(c, pair);
+  return c.json({ access_token: pair.access_token });
+});
+
 authRoutes.get("/google/start", (c) => {
   const clientId = getGoogleClientId();
   if (clientId === "") return c.json({ error: "google_not_configured" }, 503);
