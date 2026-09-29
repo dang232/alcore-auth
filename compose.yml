@@ -39,7 +39,16 @@ services:
     # defaults to ./data/auth.sqlite, i.e. /app/data/auth.sqlite here).
     volumes:
       - auth-data:/app/data
+    # Shared private network with the TokenPanel Caddy stack so the
+    # auth.${DOMAIN} vhost routes to this container by name (auth:8082).
+    # Host runtime state, created once: `docker network create alcore-auth-proxy`.
+    networks:
+      - alcore-auth-proxy
     restart: unless-stopped
 
 volumes:
   auth-data:
+
+networks:
+  alcore-auth-proxy:
+    external: true
