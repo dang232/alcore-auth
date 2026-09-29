@@ -34,4 +34,12 @@ services:
       # never a value in this file. Prod boot without it exits 1 (fail-fast,
       # src/config.ts) — that is the intended behavior, not a misconfig.
       JWT_SECRET: ${JWT_SECRET:-}
+    # Persist the SQLite identity store across rebuilds. Without this,
+    # every image rebuild wipes users/sessions (AUTH_DATABASE_PATH
+    # defaults to ./data/auth.sqlite, i.e. /app/data/auth.sqlite here).
+    volumes:
+      - auth-data:/app/data
     restart: unless-stopped
+
+volumes:
+  auth-data:
