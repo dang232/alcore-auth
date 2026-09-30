@@ -411,6 +411,7 @@ describe("OIDC code flow", () => {
     const assertion = exchangedBody.access_token;
     const claims = verifyAccess(assertion, getJwtSecret(), getIssuer(), "tokenpanel", "product_exchange");
     expect(claims.sub).toBe(userStore.findByEmail("exchange@example.com")?.id ?? "");
+    expect(claims.email).toBe("exchange@example.com");
     expect(claims.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
     expect(() => verifyAccess(assertion, getJwtSecret(), getIssuer(), "libre")).toThrow();
     const replay = await post("/oidc/exchange/token", { code, audience: "tokenpanel", intent: "product_exchange" });
