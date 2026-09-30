@@ -78,6 +78,14 @@ describe("deliverPurposeMail", () => {
     });
     expect(await deliverPurposeMail("verify", "user@example.com", "tok")).toBe("failed");
   });
+
+  test("an unconfigured transport is distinguishable from a failure", async () => {
+    resetMailSender();
+    const outcome = await deliverPurposeMail("verify", "user@example.com", "tok");
+    // "not_configured" is a different operator action from "failed": the first
+    // means SMTP_HOST is unset, the second means credentials were rejected.
+    expect(outcome).toBe("not_configured");
+  });
 });
 
 describe("non-enumeration on the purpose-request endpoints", () => {

@@ -107,6 +107,10 @@ export const smtpSender: MailSender = async (message) => {
       subject: message.subject,
       text: message.text,
     });
+    // Log success too. Silence on the happy path made "did it send?" unanswerable
+    // from the journal: only failures were recorded, so an operator could not
+    // distinguish a delivered message from a transport that was never reached.
+    console.log(`[auth-service] mail delivered to ${message.to}`);
     return "delivered";
   } catch (error) {
     console.error(
