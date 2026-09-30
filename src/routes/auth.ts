@@ -23,6 +23,7 @@ import { googleStateStore, userStore, sessionStore } from "../lib/store";
 import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential } from "../lib/google";
 import type { Session } from "../lib/store";
 import { authRateLimit } from "../lib/ratelimit";
+import { deliverPurposeMail } from "../lib/mail";
 
 export const ACCESS_TTL_SECONDS = 900; // short-lived access (15 min)
 export const REFRESH_TTL_MS = 30 * 24 * 3600 * 1000; // rotating refresh (30 d)
@@ -230,8 +231,12 @@ authRoutes.post("/verify/request", async (c) => {
   const email = str(body?.["email"]).trim().toLowerCase();
   const user = EMAIL_RE.test(email) ? userStore.findByEmail(email) : undefined;
   if (user !== undefined) {
-    // Prod sends this token by email; the HTTP surface never reveals existence.
-    void mintPurposeToken(getJwtSecret(), "verify", user.id, VERIFY_TTL_SECONDS);
+    // Deliver the minted token; the HTTP surface never reveals existence.
+    void deliverPurposeMail(
+      "verify",
+      user.email,
+      mintPurposeToken(getJwtSecret(), "verify", user.id, VERIFY_TTL_SECONDS)
+    );
   }
   return c.json({ ok: true });
 });
@@ -258,7 +263,11 @@ authRoutes.post("/reset/request", async (c) => {
   const email = str(body?.["email"]).trim().toLowerCase();
   const user = EMAIL_RE.test(email) ? userStore.findByEmail(email) : undefined;
   if (user !== undefined) {
-    void mintPurposeToken(getJwtSecret(), "reset", user.id, RESET_TTL_SECONDS);
+    void deliverPurposeMail(
+      "reset",
+      user.email,
+      mintPurposeToken(getJwtSecret(), "reset", user.id, RESET_TTL_SECONDS)
+    );
   }
   return c.json({ ok: true });
 });

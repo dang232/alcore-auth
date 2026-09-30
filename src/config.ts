@@ -147,3 +147,35 @@ export function getOidcClients(): ReadonlyMap<string, string> {
     return separator > 0 && redirectUri !== "" ? [[clientId, redirectUri]] : [];
   }));
 }
+
+export interface MailConfig {
+  readonly host: string;
+  readonly port: number;
+  readonly username: string;
+  readonly password: string;
+  readonly from: string;
+  readonly secure: boolean;
+}
+
+/**
+ * Null when SMTP_HOST is unset. Verification and reset stay non-enumerating
+ * either way: an unconfigured transport suppresses delivery instead of
+ * revealing whether an account exists.
+ */
+export function getMailConfig(): MailConfig | null {
+  const host = (process.env["SMTP_HOST"] ?? "").trim();
+  if (host === "") return null;
+  const portRaw = (process.env["SMTP_PORT"] ?? "").trim();
+  const port = portRaw === "" ? 587 : Number(portRaw);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("SMTP_PORT must be a decimal integer 1..65535");
+  }
+  return {
+    host,
+    port,
+    username: (process.env["SMTP_USERNAME"] ?? "").trim(),
+    password: process.env["SMTP_PASSWORD"] ?? "",
+    from: (process.env["SMTP_FROM"] ?? "").trim(),
+    secure: port === 465,
+  };
+}

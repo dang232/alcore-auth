@@ -81,13 +81,23 @@ bunx tsc --noEmit
 ```
 
 Required env for prod: `JWT_SECRET` (32+ chars), `AUTH_ISSUER`,
-`AUTH_ALLOWED_ORIGINS`. See `src/config.ts`.
+`AUTH_ALLOWED_ORIGINS`. Mail (needed for verification + reset delivery):
+`SMTP_HOST`, `SMTP_FROM`, optionally `SMTP_PORT` / `SMTP_USERNAME` /
+`SMTP_PASSWORD`. See `src/config.ts`.
 
 ## Flags / risks for the owner
 
-- Stores are **in-memory** — a persistent store is a downstream/prod
-  decision (flagged, not hidden).
-- Google callback is a **stub** (see above).
+- Stores are **persistent SQLite** (`bun:sqlite`, `AUTH_DATABASE_PATH`,
+  default `./data/auth.sqlite`) with WAL journaling and `foreign_keys = ON`;
+  mount that path on a volume to survive container replacement.
+- Verification and password-reset mail needs `SMTP_HOST` (plus optional
+  `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`). **When
+  `SMTP_HOST` is unset the purpose tokens are minted but never delivered**, so
+  accounts cannot self-verify or self-reset. Both request endpoints still
+  answer an identical always-200 response either way, so an unconfigured
+  transport never becomes an account-existence oracle.
+- `email_verified` only flips when a token delivered to the address is
+  consumed; with no transport configured it stays `0`.
 - **License TBD by owner** (no LICENSE file committed deliberately;
   siblings: TokenPanel AGPL-3.0-only, Libre Apache-2.0).
 
