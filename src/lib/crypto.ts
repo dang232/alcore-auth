@@ -40,6 +40,10 @@ export interface AccessPayload {
   readonly aud: string;
   readonly exp: number;
   readonly intent: string;
+  // Present only on product-exchange assertions, where the consuming product
+  // needs the verified address to provision its own profile. Never added to
+  // browser session or OIDC assertions.
+  readonly email?: string;
 }
 
 type ParsedAccessPayload = {
@@ -49,6 +53,7 @@ type ParsedAccessPayload = {
   readonly aud: string;
   readonly exp: number;
   readonly intent: string;
+  readonly email?: string;
 };
 
 export const JWT_ALG = "HS256";
@@ -86,13 +91,18 @@ function signData(data: string, secret: string): string {
 }
 
 export function signAccess(
-  claims: Pick<AccessPayload, "sub" | "sid" | "iss" | "aud" | "intent">,
+  claims: Pick<AccessPayload, "sub" | "sid" | "iss" | "aud" | "intent"> & {
+    readonly email?: string;
+  },
   secret: string,
   ttlSeconds: number,
 ): string {
   const header = { alg: JWT_ALG, typ: JWT_TYP };
   const now = Math.floor(Date.now() / 1000);
-  const payload: AccessPayload = { ...claims, exp: now + ttlSeconds };
+  const payload: AccessPayload =
+    claims.email === undefined || claims.email === ""
+      ? { ...claims, exp: now + ttlSeconds }
+      : { ...claims, email: claims.email, exp: now + ttlSeconds };
   const data = `${b64UrlEncode(JSON.stringify(header))}.${b64UrlEncode(JSON.stringify(payload))}`;
   return `${data}.${signData(data, secret)}`;
 }
@@ -144,6 +154,7 @@ export function verifyAccess(token: string, secret: string, expectedIss: string,
     aud: p.aud,
     exp: p.exp,
     intent: p.intent,
+    ...(typeof p.email === "string" && p.email !== "" ? { email: p.email } : {}),
   } satisfies ParsedAccessPayload;
 }
 

@@ -156,8 +156,12 @@ oidcRoutes.post("/exchange/token", async (c) => {
   if (session === undefined || session.revoked || session.expiresAt <= Date.now() || session.userId !== exchange.userId) {
     return c.json({ error: "invalid_grant" }, 400);
   }
+  // The consuming product provisions its own profile and needs the verified
+  // address to do so. The assertion stays server-to-server and short-lived.
+  const exchangedUser = userStore.findById(exchange.userId);
   const token = signAccess({
     sub: exchange.userId, sid: exchange.sessionId, iss: getIssuer(), aud: exchange.audience, intent: exchange.intent,
+    ...(exchangedUser === undefined ? {} : { email: exchangedUser.email }),
   }, getJwtSecret(), PRODUCT_EXCHANGE_TTL_SECONDS);
   return c.json({ access_token: token, token_type: "Bearer", expires_in: PRODUCT_EXCHANGE_TTL_SECONDS });
 });
