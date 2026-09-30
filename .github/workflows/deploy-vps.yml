@@ -33,6 +33,18 @@ jobs:
             cd "${{ secrets.VPS_PROJECT_DIR }}"
             test -d .git || { echo "VPS_PROJECT_DIR is not a Git checkout." >&2; exit 1; }
             test -f compose.yml || { echo "compose.yml missing in VPS_PROJECT_DIR." >&2; exit 1; }
+            # Guard BEFORE recreating the container. This guard exists because
+            # the first deploy attempt crashed production: Auth fails closed
+            # without JWT_SECRET, and `docker compose up -d` rebuilds the
+            # container from compose state alone, so a secret that had only ever
+            # been exported in an earlier shell was dropped on recreate and the
+            # identity service crash-looped. Checking after the recreate would
+            # be checking whether the outage already happened.
+            if ! grep -qE '^JWT_SECRET=.+' .env 2>/dev/null; then
+              echo "Refusing to deploy: JWT_SECRET is not set in ${PWD}/.env." >&2
+              echo "Auth fails closed without it; recreating the container would take production down." >&2
+              exit 1
+            fi
             timeout 2m git fetch origin main
             git reset --hard origin/main
             # Build on the VPS: no CI image exists for this service, so
