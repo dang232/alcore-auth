@@ -1,0 +1,53 @@
+name: Deploy to VPS
+
+# Manual-only on purpose. This service owns the identity store, and unlike the
+# sibling repos it has no CI image pipeline — the deploy builds on the VPS. Add
+# `push: branches: [main]` only after the first manual run has been verified and
+# the VPS_* secrets below are confirmed present on this repository.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps-auth
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # This job only shells over SSH; it needs no GITHUB_TOKEN scopes.
+    permissions: {}
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_SSH_PORT }}
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.VPS_PROJECT_DIR }}"
+            test -d .git || { echo "VPS_PROJECT_DIR is not a Git checkout." >&2; exit 1; }
+            test -f compose.yml || { echo "compose.yml missing in VPS_PROJECT_DIR." >&2; exit 1; }
+            timeout 2m git fetch origin main
+            git reset --hard origin/main
+            # Build on the VPS: no CI image exists for this service, so
+            # --no-build/--pull never would pin production to a stale image.
+            timeout 10m docker compose up -d --build
+            timeout 30s docker compose ps
+            PORT=$(awk -F= '$1 == "AUTH_PORT" { print $2; exit }' .env 2>/dev/null || true)
+            PORT=${PORT:-8082}
+            for attempt in $(seq 1 36); do
+              if curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${PORT}/health/ready" > /dev/null 2>&1; then
+                echo "Auth healthy on port ${PORT}."
+                curl --silent "http://127.0.0.1:${PORT}/health/ready" || true
+                echo
+                exit 0
+              fi
+              sleep 5
+            done
+            timeout 30s docker compose logs --tail=100 auth || true
+            echo "Auth health check failed on localhost port ${PORT}." >&2
+            exit 1
