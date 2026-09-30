@@ -76,7 +76,7 @@ subject, expiry, and `intent === oidc`.
 ```sh
 bun install
 bun run dev          # http://localhost:8082 (AUTH_PORT)
-bun test             # 18 tests: 12 auth + 6 readiness
+bun test             # 59 tests across auth, cors, health-ready, mail
 bunx tsc --noEmit
 ```
 
