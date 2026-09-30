@@ -50,8 +50,8 @@ app.get('/health', (c) => {
 app.get('/health/ready', (c) => {
   const r = authReadiness()
   const body = r.ready
-    ? { status: 'ok' as const, checks: r.checks }
-    : { status: 'unavailable' as const, checks: r.checks, reasons: r.reasons }
+    ? { status: 'ok' as const, checks: r.checks, population: r.population, userCount: r.userCount }
+    : { status: 'unavailable' as const, checks: r.checks, reasons: r.reasons, population: r.population, userCount: r.userCount }
   return c.json(body, r.ready ? 200 : 503)
 })
 app.route('/auth', authRoutes)

@@ -24,9 +24,24 @@ describe("GET /health/ready", () => {
     const body = (await res.json()) as {
       status: string;
       checks: Record<string, string>;
+      population: string;
+      userCount: number | null;
     };
     expect(body.status).toBe("ok");
     expect(body.checks).toEqual({ config: "ok", store: "ok", signer: "ok" });
+    expect(["populated", "empty", "unknown"]).toContain(body.population);
+  });
+
+  test("response surfaces user population so an unseeded DB is visible", async () => {
+    const res = await app.request("/health/ready");
+    const body = (await res.json()) as {
+      population: string;
+      userCount: number | null;
+    };
+    expect(typeof body.userCount === "number" || body.userCount === null).toBe(true);
+    expect(body.population).toBe(
+      body.userCount === null ? "unknown" : body.userCount > 0 ? "populated" : "empty",
+    );
   });
 
   test("failing config short-circuits to 503 with reasons (fail-closed)", () => {
@@ -37,6 +52,7 @@ describe("GET /health/ready", () => {
       resolveIssuer: () => "https://auth.alcore.io.vn",
       probeStore: () => true,
       roundTripSigner: () => true,
+      countUsers: () => 1,
     });
     expect(r.ready).toBe(false);
     expect(r.status).toBe("unavailable");
@@ -49,6 +65,7 @@ describe("GET /health/ready", () => {
       resolveIssuer: () => "https://auth.alcore.io.vn",
       probeStore: () => false,
       roundTripSigner: () => true,
+      countUsers: () => 1,
     });
     expect(r.ready).toBe(false);
     expect(r.checks.store).toBe("down");
@@ -63,10 +80,51 @@ describe("GET /health/ready", () => {
       roundTripSigner: () => {
         throw new Error("bad signature");
       },
+      countUsers: () => 1,
     });
     expect(r.ready).toBe(false);
     expect(r.checks.signer).toBe("down");
     expect(r.reasons).toContain("signer_failed");
+  });
+
+  test("empty user table reports population=empty but stays ready", () => {
+    const r = authReadiness({
+      resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
+      resolveIssuer: () => "https://auth.alcore.io.vn",
+      probeStore: () => true,
+      roundTripSigner: () => true,
+      countUsers: () => 0,
+    });
+    expect(r.population).toBe("empty");
+    expect(r.userCount).toBe(0);
+    expect(r.ready).toBe(true);
+  });
+
+  test("seeded user table reports population=populated with the count", () => {
+    const r = authReadiness({
+      resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
+      resolveIssuer: () => "https://auth.alcore.io.vn",
+      probeStore: () => true,
+      roundTripSigner: () => true,
+      countUsers: () => 12,
+    });
+    expect(r.population).toBe("populated");
+    expect(r.userCount).toBe(12);
+  });
+
+  test("a failing count degrades to unknown and never flips readiness", () => {
+    const r = authReadiness({
+      resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
+      resolveIssuer: () => "https://auth.alcore.io.vn",
+      probeStore: () => true,
+      roundTripSigner: () => true,
+      countUsers: () => {
+        throw new Error("count failed");
+      },
+    });
+    expect(r.population).toBe("unknown");
+    expect(r.userCount).toBeNull();
+    expect(r.ready).toBe(true);
   });
 
   test("substrate probe and signer round-trip are genuine (not stubs)", () => {

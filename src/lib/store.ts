@@ -184,6 +184,9 @@ export const userStore = {
   setPasswordHash(id: string, hash: string): void {
     db.query("UPDATE users SET password_hash=? WHERE id=?").run(hash, id);
   },
+  count(): number {
+    return Number((db.query("SELECT COUNT(*) AS c FROM users").get() as Row)["c"]);
+  },
 };
 
 export const sessionStore = {
