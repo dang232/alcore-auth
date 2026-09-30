@@ -34,6 +34,19 @@ services:
       # never a value in this file. Prod boot without it exits 1 (fail-fast,
       # src/config.ts) — that is the intended behavior, not a misconfig.
       JWT_SECRET: ${JWT_SECRET:-}
+      # Google passthroughs. Compose only substitutes variables the file
+      # references, so an unset key here means a value placed in .env is
+      # silently dropped and /auth/google/config keeps answering an empty
+      # clientId. The client ID is public by design (it ships to browsers);
+      # the secret is only needed by the /auth/google/callback code flow.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
     # Persist the SQLite identity store across rebuilds. Without this,
     # every image rebuild wipes users/sessions (AUTH_DATABASE_PATH
     # defaults to ./data/auth.sqlite, i.e. /app/data/auth.sqlite here).
