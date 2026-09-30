@@ -173,8 +173,11 @@ export function getMailConfig(): MailConfig | null {
   return {
     host,
     port,
-    username: (process.env["SMTP_USERNAME"] ?? "").trim(),
-    password: process.env["SMTP_PASSWORD"] ?? "",
+    // SMTP_USER/SMTP_PASS match the platform-wide convention already used by
+    // TokenPanel's config fields and generated manifest. SMTP_USERNAME/
+    // SMTP_PASSWORD are accepted as aliases so either .env layout works.
+    username: (process.env["SMTP_USER"] ?? process.env["SMTP_USERNAME"] ?? "").trim(),
+    password: process.env["SMTP_PASS"] ?? process.env["SMTP_PASSWORD"] ?? "",
     from: (process.env["SMTP_FROM"] ?? "").trim(),
     secure: port === 465,
   };

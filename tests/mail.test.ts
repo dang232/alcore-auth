@@ -23,6 +23,7 @@ import {
   type MailMessage,
 } from "../src/lib/mail";
 import { userStore } from "../src/lib/store";
+import { getMailConfig } from "../src/config";
 
 const sent: MailMessage[] = [];
 
@@ -32,6 +33,75 @@ function capturingSender(outcome: "delivered" | "not_configured" | "failed" = "d
     return outcome;
   });
 }
+
+describe("getMailConfig credential resolution", () => {
+  const CREDENTIAL_KEYS = [
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS",
+    "SMTP_USERNAME",
+    "SMTP_PASSWORD",
+    "SMTP_FROM",
+  ] as const;
+
+  beforeEach(() => {
+    for (const key of CREDENTIAL_KEYS) delete process.env[key];
+    process.env["SMTP_HOST"] = "smtp.gmail.com";
+  });
+  afterEach(() => {
+    for (const key of CREDENTIAL_KEYS) delete process.env[key];
+  });
+
+  test("reads the platform-wide SMTP_USER / SMTP_PASS spelling", () => {
+    process.env["SMTP_USER"] = "user@gmail.com";
+    process.env["SMTP_PASS"] = "app-password";
+    const config = getMailConfig();
+    expect(config?.username).toBe("user@gmail.com");
+    expect(config?.password).toBe("app-password");
+  });
+
+  test("reads the SMTP_USERNAME / SMTP_PASSWORD alias", () => {
+    process.env["SMTP_USERNAME"] = "user@gmail.com";
+    process.env["SMTP_PASSWORD"] = "app-password";
+    const config = getMailConfig();
+    expect(config?.username).toBe("user@gmail.com");
+    expect(config?.password).toBe("app-password");
+  });
+
+  test("prefers SMTP_USER over the alias when both are present", () => {
+    process.env["SMTP_USER"] = "canonical@gmail.com";
+    process.env["SMTP_PASS"] = "canonical-pass";
+    process.env["SMTP_USERNAME"] = "alias@gmail.com";
+    process.env["SMTP_PASSWORD"] = "alias-pass";
+    const config = getMailConfig();
+    expect(config?.username).toBe("canonical@gmail.com");
+    expect(config?.password).toBe("canonical-pass");
+  });
+
+  test("an empty password stays empty rather than falling back to a placeholder", () => {
+    process.env["SMTP_USER"] = "user@gmail.com";
+    const config = getMailConfig();
+    expect(config?.username).toBe("user@gmail.com");
+    expect(config?.password).toBe("");
+  });
+
+  test("defaults to port 587 with implicit STARTTLS, not implicit TLS", () => {
+    process.env["SMTP_USER"] = "user@gmail.com";
+    expect(getMailConfig()?.port).toBe(587);
+    expect(getMailConfig()?.secure).toBe(false);
+  });
+
+  test("port 465 opts into implicit TLS", () => {
+    process.env["SMTP_PORT"] = "465";
+    expect(getMailConfig()?.secure).toBe(true);
+  });
+
+  test("a non-numeric port is rejected loudly instead of silently defaulting", () => {
+    process.env["SMTP_PORT"] = "not-a-port";
+    expect(() => getMailConfig()).toThrow(/SMTP_PORT/);
+  });
+});
 
 describe("purposeLink", () => {
   test("builds an issuer-scoped consume URL with the token encoded", () => {
