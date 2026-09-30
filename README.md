@@ -82,8 +82,11 @@ bunx tsc --noEmit
 
 Required env for prod: `JWT_SECRET` (32+ chars), `AUTH_ISSUER`,
 `AUTH_ALLOWED_ORIGINS`. Mail (needed for verification + reset delivery):
-`SMTP_HOST`, `SMTP_FROM`, optionally `SMTP_PORT` / `SMTP_USERNAME` /
-`SMTP_PASSWORD`. See `src/config.ts`.
+`SMTP_HOST`, `SMTP_FROM`, optionally `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS`.
+`SMTP_USERNAME` / `SMTP_PASSWORD` are accepted as aliases for the credential
+pair, but `SMTP_USER` / `SMTP_PASS` are canonical: they match TokenPanel's
+config fields and generated manifest, so the same `.env` works for either
+service. See `src/config.ts`.
 
 ## Flags / risks for the owner
 
@@ -91,11 +94,15 @@ Required env for prod: `JWT_SECRET` (32+ chars), `AUTH_ISSUER`,
   default `./data/auth.sqlite`) with WAL journaling and `foreign_keys = ON`;
   mount that path on a volume to survive container replacement.
 - Verification and password-reset mail needs `SMTP_HOST` (plus optional
-  `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`). **When
+  `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`). **When
   `SMTP_HOST` is unset the purpose tokens are minted but never delivered**, so
   accounts cannot self-verify or self-reset. Both request endpoints still
   answer an identical always-200 response either way, so an unconfigured
   transport never becomes an account-existence oracle.
+- A set `SMTP_HOST` with an empty credential is **not** the same as an unset
+  one: the transport is configured, so a request reports `failed` (creds
+  rejected) instead of `not_configured` (operator has not finished setup).
+  Watch the `[auth-service] mail delivery failed:` line when debugging.
 - `email_verified` only flips when a token delivered to the address is
   consumed; with no transport configured it stays `0`.
 - **License TBD by owner** (no LICENSE file committed deliberately;
