@@ -5,6 +5,7 @@
 
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { getCookie } from "hono/cookie";
 import { getJwtSecret, getIssuer, getAllowedOrigins, getOidcClients } from "../config";
 import { hashToken, randomToken, verifyAccess, signAccess, JwtError } from "../lib/crypto";
 import { oidcStore, productExchangeStore, sessionStore, userStore } from "../lib/store";
@@ -139,18 +140,95 @@ oidcRoutes.post("/exchange", async (c) => {
   return c.json({ code, expires_in: PRODUCT_EXCHANGE_TTL_SECONDS });
 });
 
+/**
+ * Resolves the Auth session from the HttpOnly `alcore_at` cookie. Deliberately
+ * mirrors `bearerSub`: same issuer/audience/intent checks and the same
+ * revoked-or-expired rejection, so a cookie session is exactly as strict as a
+ * Bearer session.
+ */
+function cookieSession(c: Context): { userId: string; sessionId: string } | null {
+  const token = getCookie(c, "alcore_at") ?? "";
+  if (token === "") return null;
+  try {
+    const payload = verifyAccess(token, getJwtSecret(), getIssuer(), "auth", "session");
+    const session = sessionStore.findById(payload.sid);
+    if (session === undefined || session.revoked || session.expiresAt <= Date.now() || session.userId !== payload.sub) {
+      return null;
+    }
+    if (userStore.findById(payload.sub) === undefined) return null;
+    return { userId: payload.sub, sessionId: payload.sid };
+  } catch (e) {
+    if (!(e instanceof JwtError)) throw e;
+    return null;
+  }
+}
+
+// GET /oidc/exchange/redirect?audience=..&redirect_uri=..&state=..
+// Browser handoff. Auth is the sole identity owner, so this is the only path a
+// browser can use to obtain a product code: it authenticates with the HttpOnly
+// session cookie instead of a Bearer header JavaScript cannot read. The redirect
+// carries an opaque single-use code, never a session token.
+//
+// The redirect URI must match a registered AUTH_OIDC_CLIENTS entry exactly AND its
+// origin must be in AUTH_ALLOWED_ORIGINS, reusing the /oidc/authorize checks so
+// there is one allowlist, not two.
+oidcRoutes.get("/exchange/redirect", async (c) => {
+  if (limited(c, "exchange-redirect")) return c.json({ error: "rate_limited" }, 429);
+  const audience = c.req.query("audience") ?? "";
+  const redirectUri = c.req.query("redirect_uri") ?? "";
+  const state = c.req.query("state") ?? "";
+  if (audience !== "tokenpanel" && audience !== "libre") {
+    return c.json({ error: "invalid_audience" }, 400);
+  }
+  // State is the browser's CSRF binding, echoed back unchanged. Refusing an empty
+  // one stops a caller from silently degrading its own CSRF protection.
+  if (state === "" || state.length > 512) {
+    return c.json({ error: "invalid_state" }, 400);
+  }
+  const origin = redirectOrigin(redirectUri);
+  const registered = [...getOidcClients().values()].includes(redirectUri);
+  if (redirectUri === "" || !registered || origin === null || !getAllowedOrigins().includes(origin)) {
+    return c.json({ error: "invalid_redirect_uri" }, 400);
+  }
+  const session = cookieSession(c);
+  if (session === null) return c.json({ error: "unauthorized" }, 401);
+  const code = productExchangeStore.issueForRedirect(
+    session.userId,
+    session.sessionId,
+    audience,
+    PRODUCT_INTENT,
+    redirectUri,
+    state,
+    PRODUCT_EXCHANGE_TTL_SECONDS,
+  );
+  const sep = redirectUri.includes("?") ? "&" : "?";
+  const location =
+    `${redirectUri}${sep}code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`;
+  return c.redirect(location, 302);
+});
+
 oidcRoutes.post("/exchange/token", async (c) => {
   if (limited(c, "exchange")) return c.json({ error: "rate_limited" }, 429);
   let body: unknown;
   try { body = await c.req.json(); } catch { return c.json({ error: "invalid_request" }, 400); }
   const request = typeof body === "object" && body !== null ? body : {};
-  const code = "code" in request ? request.code : undefined;
-  const audience = "audience" in request ? request.audience : undefined;
-  const intent = "intent" in request ? request.intent : undefined;
+  const code = "code" in request ? request["code"] : undefined;
+  const audience = "audience" in request ? request["audience"] : undefined;
+  const intent = "intent" in request ? request["intent"] : undefined;
   if (typeof code !== "string" || code === "" || (audience !== "tokenpanel" && audience !== "libre") || intent !== PRODUCT_INTENT) {
     return c.json({ error: "invalid_grant" }, 400);
   }
-  const exchange = productExchangeStore.consume(code, audience, PRODUCT_INTENT);
+  // A code minted through /exchange/redirect carries a redirect+state binding and
+  // must present them; without them, fall back to the non-browser binding-free
+  // path, which refuses bound codes outright.
+  const redirectUri = "redirect_uri" in request ? request["redirect_uri"] : "";
+  const state = "state" in request ? request["state"] : "";
+  const exchange = typeof redirectUri === "string" && redirectUri !== ""
+    ? productExchangeStore.consumeForRedirect(
+        code, audience, PRODUCT_INTENT, redirectUri,
+        typeof state === "string" ? state : "",
+      )
+    : productExchangeStore.consume(code, audience, PRODUCT_INTENT);
   if (exchange === null) return c.json({ error: "invalid_grant" }, 400);
   const session = sessionStore.findById(exchange.sessionId);
   if (session === undefined || session.revoked || session.expiresAt <= Date.now() || session.userId !== exchange.userId) {

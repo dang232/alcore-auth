@@ -90,6 +90,16 @@ db.run(`
     expires_at INTEGER NOT NULL,
     used INTEGER NOT NULL DEFAULT 0
   );
+  -- Browser-issued product codes additionally bind the exact callback URI, so a
+  -- code minted for one registered redirect cannot be replayed at another. Empty
+  -- on codes issued by the non-browser POST /oidc/exchange path, which has no
+  -- redirect and keeps that caller working unchanged.
+  CREATE TABLE IF NOT EXISTS product_exchange_redirects (
+    code_hash TEXT PRIMARY KEY,
+    redirect_uri TEXT NOT NULL,
+    state_hash TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS google_states (
     state TEXT PRIMARY KEY,
     nonce TEXT NOT NULL,
@@ -270,9 +280,46 @@ export const productExchangeStore = {
     );
     return code;
   },
+  /**
+   * Browser-initiated issue. The code is bound to the exact redirect URI and to
+   * the caller's state value, so redemption must present both. Backed by a single
+   * transaction: the redirect-binding row is written in the same transaction that
+   * marks the code used, which is what makes concurrent redemption safe.
+   */
+  issueForRedirect(
+    userId: string,
+    sessionId: string,
+    audience: ProductAudience,
+    intent: string,
+    redirectUri: string,
+    state: string,
+    ttlSeconds: number,
+  ): string {
+    const code = randomHex(32);
+    const codeHash = hashExchangeCode(code);
+    const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+    db.transaction(() => {
+      db.query("INSERT INTO product_exchange_codes (code_hash,user_id,session_id,audience,intent,expires_at,used) VALUES (?,?,?,?,?,?,0)").run(
+        codeHash, userId, sessionId, audience, intent, exp,
+      );
+      db.query("INSERT INTO product_exchange_redirects (code_hash,redirect_uri,state_hash,expires_at) VALUES (?,?,?,?)").run(
+        codeHash, redirectUri, hashExchangeState(state), exp,
+      );
+    })();
+    return code;
+  },
+  /**
+   * Legacy non-browser redemption. Refuses any code that carries a redirect
+   * binding: a browser-issued code must be redeemed through
+   * `consumeForRedirect` so its redirect and state are actually verified, and
+   * this path has no way to check them.
+   */
   consume(code: string, audience: ProductAudience, intent: string): ProductExchangeCode | null {
+    const codeHash = hashExchangeCode(code);
+    const bound = db.query("SELECT 1 FROM product_exchange_redirects WHERE code_hash=?").get(codeHash);
+    if (bound !== null) return null;
     const row = db.query("UPDATE product_exchange_codes SET used=1 WHERE code_hash=? AND audience=? AND intent=? AND expires_at>? AND used=0 RETURNING user_id,session_id,audience,intent,expires_at").get(
-      hashExchangeCode(code), audience, intent, Math.floor(Date.now() / 1000),
+      codeHash, audience, intent, Math.floor(Date.now() / 1000),
     ) as Row | null;
     if (row === null) return null;
     return {
@@ -281,7 +328,45 @@ export const productExchangeStore = {
       intent: String(row["intent"]), exp: Number(row["expires_at"]),
     };
   },
+  /**
+   * Single-use redemption for browser-issued codes. Verifies the redirect binding
+   * and state inside the same transaction that marks the code used, so a replayed
+   * code fails on `used=0` even when the redirect binding is still present.
+   * `state` may be empty only for callers that present the redirect without one.
+   */
+  consumeForRedirect(
+    code: string,
+    audience: ProductAudience,
+    intent: string,
+    redirectUri: string,
+    state: string,
+  ): ProductExchangeCode | null {
+    const codeHash = hashExchangeCode(code);
+    const now = Math.floor(Date.now() / 1000);
+    return db.transaction((): ProductExchangeCode | null => {
+      const binding = db.query(
+        "SELECT redirect_uri,state_hash FROM product_exchange_redirects WHERE code_hash=? AND expires_at>?",
+      ).get(codeHash, now) as Row | null;
+      if (binding === null) return null;
+      if (String(binding["redirect_uri"]) !== redirectUri) return null;
+      if (state !== "" && String(binding["state_hash"]) !== hashExchangeState(state)) return null;
+      const row = db.query(
+        "UPDATE product_exchange_codes SET used=1 WHERE code_hash=? AND audience=? AND intent=? AND expires_at>? AND used=0 RETURNING user_id,session_id,audience,intent,expires_at",
+      ).get(codeHash, audience, intent, now) as Row | null;
+      if (row === null) return null;
+      db.query("DELETE FROM product_exchange_redirects WHERE code_hash=?").run(codeHash);
+      return {
+        code, userId: String(row["user_id"]), sessionId: String(row["session_id"]),
+        audience,
+        intent: String(row["intent"]), exp: Number(row["expires_at"]),
+      };
+    })() ?? null;
+  },
 };
+
+function hashExchangeState(state: string): string {
+  return createHash("sha256").update(state).digest("hex");
+}
 
 function hashExchangeCode(code: string): string {
   return createHash("sha256").update(code).digest("hex");
@@ -309,6 +394,7 @@ function randomHex(bytes: number): string {
 }
 
 export function resetStoresForTests(): void {
+  db.run("DELETE FROM product_exchange_redirects");
   db.run("DELETE FROM google_states");
   db.run("DELETE FROM oidc_codes");
   db.run("DELETE FROM product_exchange_codes");
