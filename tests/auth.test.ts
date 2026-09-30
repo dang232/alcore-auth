@@ -122,6 +122,91 @@ describe("verify + reset (no enumeration)", () => {
   });
 });
 
+// The emailed links are GET URLs, so the GET surface is the one users actually
+// hit. These cover it explicitly: the interstitial must render, must NOT consume
+// (link scanners prefetch GET), and the form post must do the consuming.
+describe("purpose links reached by GET (as emailed)", () => {
+  async function postForm(path: string, fields: Record<string, string>): Promise<Response> {
+    return app.request(path, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(fields).toString(),
+    });
+  }
+
+  async function registerAndId(email: string, password: string): Promise<string> {
+    await post("/auth/register", { email, password });
+    const login = await post("/auth/login", { email, password });
+    const { access_token } = (await login.json()) as { access_token: string };
+    const me = (await (await authed("/auth/me", access_token)).json()) as { id: string };
+    return me.id;
+  }
+
+  test("GET /auth/verify/consume renders HTML instead of 404", async () => {
+    const id = await registerAndId("getlink1@example.com", "s3cret-pass");
+    const token = mintPurposeToken(getJwtSecret(), "verify", id, 3600);
+    const res = await app.request(`/auth/verify/consume?token=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    const html = await res.text();
+    expect(html).toContain("<form");
+    expect(html).toContain('name="token"');
+  });
+
+  test("GET does not consume the token, so a link scanner cannot burn it", async () => {
+    const id = await registerAndId("getlink2@example.com", "s3cret-pass");
+    const token = mintPurposeToken(getJwtSecret(), "verify", id, 3600);
+    await app.request(`/auth/verify/consume?token=${encodeURIComponent(token)}`);
+    const user = userStore.findById(id);
+    expect(user?.emailVerified).toBe(false);
+  });
+
+  test("the emailed form post verifies the account", async () => {
+    const id = await registerAndId("getlink3@example.com", "s3cret-pass");
+    const token = mintPurposeToken(getJwtSecret(), "verify", id, 3600);
+    await app.request(`/auth/verify/consume?token=${encodeURIComponent(token)}`);
+    const res = await postForm("/auth/verify/consume", { token });
+    expect(res.status).toBe(200);
+    expect(userStore.findById(id)?.emailVerified).toBe(true);
+  });
+
+  test("GET /auth/reset/consume renders a password form instead of 404", async () => {
+    const id = await registerAndId("getlink4@example.com", "old-pass-123");
+    const token = mintPurposeToken(getJwtSecret(), "reset", id, 3600);
+    const res = await app.request(`/auth/reset/consume?token=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('name="newPassword"');
+    expect(html).toContain('type="password"');
+  });
+
+  test("GET /auth/reset/consume does not consume the token or change the password", async () => {
+    const id = await registerAndId("getlink5@example.com", "old-pass-123");
+    const token = mintPurposeToken(getJwtSecret(), "reset", id, 3600);
+    await app.request(`/auth/reset/consume?token=${encodeURIComponent(token)}`);
+    expect((await post("/auth/login", { email: "getlink5@example.com", password: "old-pass-123" })).status).toBe(200);
+    expect((await post("/auth/reset/consume", { token, newPassword: "new-pass-456" })).status).toBe(200);
+  });
+
+  test("the emailed reset form post sets the new password", async () => {
+    const id = await registerAndId("getlink6@example.com", "old-pass-123");
+    const token = mintPurposeToken(getJwtSecret(), "reset", id, 3600);
+    await app.request(`/auth/reset/consume?token=${encodeURIComponent(token)}`);
+    const res = await postForm("/auth/reset/consume", { token, newPassword: "new-pass-456" });
+    expect(res.status).toBe(200);
+    expect((await post("/auth/login", { email: "getlink6@example.com", password: "old-pass-123" })).status).toBe(401);
+    expect((await post("/auth/login", { email: "getlink6@example.com", password: "new-pass-456" })).status).toBe(200);
+  });
+
+  test("the interstitial escapes a hostile token instead of reflecting it raw", async () => {
+    const res = await app.request(`/auth/verify/consume?token=${encodeURIComponent('"><script>alert(1)</script>')}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+});
+
 describe("Google OAuth", () => {
   test("public config exposes an empty client id and verify fails closed without configuration", async () => {
     delete process.env["GOOGLE_CLIENT_ID"];

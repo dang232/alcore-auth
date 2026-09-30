@@ -67,6 +67,51 @@ function str(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
+function esc(v: string): string {
+  return v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Mail clients and security scanners only ever issue GET, so a link mailed to a
+// user cannot target a POST-only route -- that combination 404s and makes the
+// account unverifiable. Consuming on GET is not the fix either: scanners prefetch
+// links and would burn the token before the recipient clicks. GET renders an
+// interstitial; only the POST consumes.
+function purposePage(heading: string, message: string, fields: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(heading)}</title>
+<style>
+body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:2rem 1rem;background:#f6f7f9;color:#111}
+main{max-width:26rem;margin:0 auto;background:#fff;padding:1.5rem;border:1px solid #e3e5e8;border-radius:.5rem}
+h1{font-size:1.25rem;margin:0 0 .5rem}
+p{margin:0 0 1rem;color:#444}
+label{display:block;margin:.75rem 0 .25rem;font-weight:600;font-size:.875rem}
+input{width:100%;padding:.6rem .7rem;font-size:1rem;border:1px solid #c9cdd2;border-radius:.375rem;box-sizing:border-box}
+button{margin-top:1rem;width:100%;padding:.65rem;font-size:1rem;font-weight:600;color:#fff;background:#111;border:0;border-radius:.375rem;cursor:pointer}
+button:hover{background:#333}
+</style>
+</head>
+<body><main><h1>${esc(heading)}</h1><p>${esc(message)}</p>
+<form method="post">${fields}<button type="submit">Continue</button></form>
+</main></body>
+</html>`;
+}
+
+// The interstitial form posts application/x-www-form-urlencoded, while API
+// clients post JSON. Both must reach the same handler.
+async function readPurposeBody(c: Context): Promise<{ token: string; newPassword: string }> {
+  const type = c.req.header("content-type") ?? "";
+  if (type.includes("application/x-www-form-urlencoded") || type.includes("multipart/form-data")) {
+    const form = await c.req.parseBody();
+    return { token: str(form["token"]), newPassword: str(form["newPassword"]) };
+  }
+  const body = await readJson(c);
+  return { token: str(body?.["token"]), newPassword: str(body?.["newPassword"]) };
+}
+
 function bearer(c: Context): string {
   const h = c.req.header("authorization") ?? "";
   const m = /^Bearer (.+)$/.exec(h.trim());
@@ -241,11 +286,24 @@ authRoutes.post("/verify/request", async (c) => {
   return c.json({ ok: true });
 });
 
-// POST /auth/verify/consume
+// GET /verify/consume — interstitial only; the token is consumed by the POST
+// below. Reached by clicking the link in the verification email.
+authRoutes.get("/verify/consume", (c) => {
+  const token = c.req.query("token") ?? "";
+  return c.html(
+    purposePage(
+      "Confirm your email",
+      "Confirm to finish verifying your address.",
+      `<input type="hidden" name="token" value="${esc(token)}">`,
+    ),
+  );
+});
+
+// POST /auth/verify/consume — accepts JSON or a form post (see readPurposeBody).
 authRoutes.post("/verify/consume", async (c) => {
-  const body = await readJson(c);
+  const { token } = await readPurposeBody(c);
   try {
-    const { userId } = verifyPurposeToken(getJwtSecret(), "verify", str(body?.["token"]));
+    const { userId } = verifyPurposeToken(getJwtSecret(), "verify", token);
     const user = userStore.findById(userId);
     if (user === undefined) return c.json({ error: "invalid_token" }, 400);
     userStore.setVerified(userId);
@@ -272,16 +330,30 @@ authRoutes.post("/reset/request", async (c) => {
   return c.json({ ok: true });
 });
 
+// GET /auth/reset/consume — interstitial only; the POST below sets the password
+// and consumes the token, so a link scanner cannot invalidate the reset.
+authRoutes.get("/reset/consume", (c) => {
+  const token = c.req.query("token") ?? "";
+  return c.html(
+    purposePage(
+      "Choose a new password",
+      "Set a new password to finish resetting your account.",
+      `<input type="hidden" name="token" value="${esc(token)}">
+<label for="newPassword">New password (8 characters or more)</label>
+<input id="newPassword" name="newPassword" type="password" minlength="8" autocomplete="new-password" required>`,
+    ),
+  );
+});
+
 // POST /auth/reset/consume — sets new password, revokes all sessions.
 authRoutes.post("/reset/consume", async (c) => {
-  const body = await readJson(c);
-  const next = str(body?.["newPassword"]);
-  if (next.length < 8) return c.json({ error: "weak_password" }, 400);
+  const { token, newPassword } = await readPurposeBody(c);
+  if (newPassword.length < 8) return c.json({ error: "weak_password" }, 400);
   try {
-    const { userId } = verifyPurposeToken(getJwtSecret(), "reset", str(body?.["token"]));
+    const { userId } = verifyPurposeToken(getJwtSecret(), "reset", token);
     const user = userStore.findById(userId);
     if (user === undefined) return c.json({ error: "invalid_token" }, 400);
-    userStore.setPasswordHash(userId, await hashPassword(next));
+    userStore.setPasswordHash(userId, await hashPassword(newPassword));
     sessionStore.revokeAllForUser(userId);
     return c.json({ ok: true });
   } catch (e) {
