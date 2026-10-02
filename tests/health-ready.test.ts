@@ -3,19 +3,25 @@
 // failure maps to 503 with a reason, and the signer path uses genuine
 // HS256 sign→verify (a tampered token fails closed).
 
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach } from "bun:test";
 
 process.env["JWT_SECRET"] = "test-only-dummy-secret-0123456789abcdef";
 process.env["ALLOW_WEAK_JWT_SECRET"] = "1";
 process.env["NODE_ENV"] = "test";
 
 import { app } from "../src/index";
+import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import {
   authReadiness,
   probeIdentitySubstrate,
   roundTripSigner,
 } from "../src/lib/readiness";
 import { signAccess, verifyAccess } from "../src/lib/crypto";
+
+beforeEach(() => {
+  resetRateLimitsForTests();
+  resetThrottleConnForTests();
+});
 
 describe("GET /health/ready", () => {
   test("200 with ok status and per-check detail when substrate is healthy", async () => {
