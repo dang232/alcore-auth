@@ -6,16 +6,22 @@ process.env["JWT_SECRET"] = "test-only-dummy-secret-0123456789abcdef";
 process.env["ALLOW_WEAK_JWT_SECRET"] = "1";
 process.env["NODE_ENV"] = "test";
 
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach } from "bun:test";
 import { join } from "node:path";
 import { app } from "../src/index";
-import { getJwtSecret } from "../src/config";
+import { getJwtRotationKeys, getJwtSecret } from "../src/config";
 import { mintPurposeToken, signAccess, verifyAccess } from "../src/lib/crypto";
-import { createRateLimiter } from "../src/lib/ratelimit";
+import { createRateLimiter, resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { googleStateStore, resetStoresForTests, userStore } from "../src/lib/store";
 import { getIssuer } from "../src/config";
+import { baseGoogleClaims, createGoogleTestRig, TEST_GOOGLE_CLIENT_ID } from "./google-jwks-helper";
 
 resetStoresForTests();
+
+beforeEach(() => {
+  resetRateLimitsForTests();
+  resetThrottleConnForTests();
+});
 
 async function post(path: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
   return app.request(path, {
@@ -224,26 +230,23 @@ describe("Google OAuth", () => {
   });
 
   test("verify creates or links a user and issues a session", async () => {
-    const originalFetch = globalThis.fetch;
     const oldClientId = process.env["GOOGLE_CLIENT_ID"];
-    process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
-    globalThis.fetch = mockFetch(async () => response(200, {
-      aud: "test-client.apps.googleusercontent.com", iss: "accounts.google.com",
-      exp: String(Math.floor(Date.now() / 1000) + 300), sub: "google-verify-sub",
-      email: "google-verify@example.com", email_verified: true,
-    }));
+    process.env["GOOGLE_CLIENT_ID"] = TEST_GOOGLE_CLIENT_ID;
+    const rig = createGoogleTestRig();
+    const token = rig.mintIdToken(baseGoogleClaims({ sub: "google-verify-sub", email: "google-verify@example.com" }));
+    const { restore } = rig.installFetch(token);
     try {
-      const res = await post("/auth/google/verify", { idToken: "mock-id-token" });
+      const res = await post("/auth/google/verify", { idToken: token });
       expect(res.status).toBe(200);
       const body = (await res.json()) as { access_token: string };
       const user = userStore.findByEmail("google-verify@example.com");
       expect(user).toBeDefined();
-      expect(verifyAccess(body.access_token, getJwtSecret(), getIssuer(), "auth", "session").sub)
+      expect(verifyAccess(body.access_token, getJwtRotationKeys(), getIssuer(), "auth", "session").sub)
         .toBe(user === undefined ? "missing-user" : user.id);
       const linkedUser = userStore.findByProviderSub("google", "google-verify-sub");
       expect(linkedUser?.id).toBe(user?.id);
     } finally {
-      globalThis.fetch = originalFetch;
+      restore();
       if (oldClientId === undefined) delete process.env["GOOGLE_CLIENT_ID"];
       else process.env["GOOGLE_CLIENT_ID"] = oldClientId;
     }
@@ -253,9 +256,13 @@ describe("Google OAuth", () => {
     const originalFetch = globalThis.fetch;
     const oldClientId = process.env["GOOGLE_CLIENT_ID"];
     process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
+    // Structurally valid token so verification reaches the JWKS fetch, which
+    // then fails: JWKS transport failure is the only 502 path (todo 35).
+    const rig = createGoogleTestRig();
+    const token = rig.mintIdToken(baseGoogleClaims({ sub: "upstream-sub", email: "upstream@example.com" }));
     globalThis.fetch = mockFetch(async () => { throw new Error("network down"); });
     try {
-      const res = await post("/auth/google/verify", { idToken: "mock-id-token" });
+      const res = await post("/auth/google/verify", { idToken: token });
       expect(res.status).toBe(502);
       expect(await res.json()).toEqual({ error: "upstream_unavailable" });
     } finally {
@@ -322,19 +329,19 @@ describe("Google OAuth", () => {
   }
 
   function successfulGoogleFetch(nonce: string): typeof globalThis.fetch {
+    // JWKS contract (todo 35): the token endpoint returns a signed ID token;
+    // verification happens locally against the served key set.
+    const rig = createGoogleTestRig();
+    const token = rig.mintIdToken(baseGoogleClaims({
+      nonce,
+      sub: "google-user-1",
+      email: "google@example.com",
+    }));
     return mockFetch(async (input) => {
-      if (String(input).includes("/tokeninfo?")) {
-        return response(200, {
-          aud: "test-client.apps.googleusercontent.com",
-          iss: "https://accounts.google.com",
-          nonce,
-          exp: String(Math.floor(Date.now() / 1000) + 300),
-          sub: "google-user-1",
-          email: "google@example.com",
-          email_verified: true,
-        });
+      if (String(input).includes("/certs")) {
+        return response(200, rig.jwksBody);
       }
-      return response(200, { id_token: "test-id-token" });
+      return response(200, { id_token: token });
     });
   }
 
@@ -356,13 +363,16 @@ describe("Google OAuth", () => {
 
   test("verified Google email links to existing user", async () => {
     const user = userStore.create("link@example.com", "password-hash");
-    const res = await callbackWithFetch((nonce) => mockFetch(async (input) => {
-      if (String(input).includes("/tokeninfo?")) return response(200, {
-        aud: "test-client.apps.googleusercontent.com", iss: "accounts.google.com", nonce,
-        exp: String(Math.floor(Date.now() / 1000) + 300), sub: "google-linked", email: "link@example.com", email_verified: true,
+    const linkRig = createGoogleTestRig();
+    const res = await callbackWithFetch((nonce) => {
+      const token = linkRig.mintIdToken(baseGoogleClaims({
+        nonce, sub: "google-linked", email: "link@example.com",
+      }));
+      return mockFetch(async (input) => {
+        if (String(input).includes("/certs")) return response(200, linkRig.jwksBody);
+        return response(200, { id_token: token });
       });
-      return response(200, { id_token: "test-id-token" });
-    }), async (state) => performCallback(state));
+    }, async (state) => performCallback(state));
     expect(res.status).toBe(200);
     expect((await res.json()).user.id).toBe(user.id);
   });
@@ -371,13 +381,16 @@ describe("Google OAuth", () => {
     const owner = userStore.create("owner@example.com", null);
     const another = userStore.create("other@example.com", null);
     userStore.linkIdentity(owner.id, "google", "google-conflict");
-    const res = await callbackWithFetch((nonce) => mockFetch(async (input) => {
-      if (String(input).includes("/tokeninfo?")) return response(200, {
-        aud: "test-client.apps.googleusercontent.com", iss: "accounts.google.com", nonce,
-        exp: String(Math.floor(Date.now() / 1000) + 300), sub: "google-conflict", email: another.email, email_verified: true,
+    const conflictRig = createGoogleTestRig();
+    const res = await callbackWithFetch((nonce) => {
+      const token = conflictRig.mintIdToken(baseGoogleClaims({
+        nonce, sub: "google-conflict", email: another.email,
+      }));
+      return mockFetch(async (input) => {
+        if (String(input).includes("/certs")) return response(200, conflictRig.jwksBody);
+        return response(200, { id_token: token });
       });
-      return response(200, { id_token: "test-id-token" });
-    }), async (state) => performCallback(state));
+    }, async (state) => performCallback(state));
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: "identity_conflict" });
   });
@@ -397,7 +410,11 @@ describe("Google OAuth", () => {
   });
 
   test("callback keeps invalid Google credentials at 401", async () => {
-    const res = await callbackWithFetch(() => mockFetch(async () => response(401, {})), async (state) => performCallback(state));
+    const badRig = createGoogleTestRig();
+    const res = await callbackWithFetch(() => mockFetch(async (input) => {
+      if (String(input).includes("/certs")) return response(200, badRig.jwksBody);
+      return response(200, { id_token: "not-a-jwt" });
+    }), async (state) => performCallback(state));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "invalid_google_credential" });
   });
@@ -494,11 +511,11 @@ describe("OIDC code flow", () => {
       throw new Error("exchange did not return an assertion");
     }
     const assertion = exchangedBody.access_token;
-    const claims = verifyAccess(assertion, getJwtSecret(), getIssuer(), "tokenpanel", "product_exchange");
+    const claims = verifyAccess(assertion, getJwtRotationKeys(), getIssuer(), "tokenpanel", "product_exchange");
     expect(claims.sub).toBe(userStore.findByEmail("exchange@example.com")?.id ?? "");
     expect(claims.email).toBe("exchange@example.com");
     expect(claims.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
-    expect(() => verifyAccess(assertion, getJwtSecret(), getIssuer(), "libre")).toThrow();
+    expect(() => verifyAccess(assertion, getJwtRotationKeys(), getIssuer(), "libre")).toThrow();
     const replay = await post("/oidc/exchange/token", { code, audience: "tokenpanel", intent: "product_exchange" });
     expect(replay.status).toBe(400);
   });
@@ -526,5 +543,82 @@ describe("guards", () => {
     expect(proc.exitCode).not.toBe(0);
     const stderr = proc.stderr.toString();
     expect(stderr).toContain("JWT_SECRET");
+  });
+});
+
+describe("change password (POST /auth/change)", () => {
+  async function change(
+    token: string,
+    body: unknown,
+  ): Promise<Response> {
+    return app.request("/auth/change", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function registerAndLogin(email: string, password: string): Promise<{ access_token: string; refresh_token: string }> {
+    await post("/auth/register", { email, password });
+    const login = await post("/auth/login", { email, password });
+    expect(login.status).toBe(200);
+    return (await login.json()) as { access_token: string; refresh_token: string };
+  }
+
+  test("happy path: change works, new password logs in, old password 401s", async () => {
+    const pair = await registerAndLogin("changepw1@example.com", "old-pass-123");
+    const res = await change(pair.access_token, { currentPassword: "old-pass-123", newPassword: "new-pass-456" });
+    expect(res.status).toBe(200);
+    expect((await res.json()) as Record<string, unknown>).toMatchObject({ ok: true });
+    expect((await post("/auth/login", { email: "changepw1@example.com", password: "old-pass-123" })).status).toBe(401);
+    expect((await post("/auth/login", { email: "changepw1@example.com", password: "new-pass-456" })).status).toBe(200);
+  });
+
+  test("wrong current password → identical 401, session and password unchanged", async () => {
+    const pair = await registerAndLogin("changepw2@example.com", "old-pass-123");
+    const res = await change(pair.access_token, { currentPassword: "not-the-password", newPassword: "new-pass-456" });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "invalid_credentials" });
+    // No session change: the caller's session still lists, and the old
+    // password still logs in while the attempted new one does not.
+    expect((await authed("/auth/sessions", pair.access_token)).status).toBe(200);
+    expect((await post("/auth/login", { email: "changepw2@example.com", password: "old-pass-123" })).status).toBe(200);
+    expect((await post("/auth/login", { email: "changepw2@example.com", password: "new-pass-456" })).status).toBe(401);
+  });
+
+  test("success revokes ALL sessions incl. current, minting exactly one fresh session", async () => {
+    const first = await registerAndLogin("changepw3@example.com", "old-pass-123");
+    const secondLogin = await post("/auth/login", { email: "changepw3@example.com", password: "old-pass-123" });
+    const second = (await secondLogin.json()) as { access_token: string; refresh_token: string };
+    const res = await change(first.access_token, { currentPassword: "old-pass-123", newPassword: "new-pass-456" });
+    expect(res.status).toBe(200);
+    const fresh = (await res.json()) as { access_token: string; refresh_token: string };
+    // Both pre-change sessions are dead: gated surface rejects them, and
+    // both refresh tokens are rejected.
+    expect((await authed("/auth/sessions", first.access_token)).status).toBe(401);
+    expect((await authed("/auth/sessions", second.access_token)).status).toBe(401);
+    expect((await post("/auth/refresh", { refresh_token: first.refresh_token })).status).toBe(401);
+    expect((await post("/auth/refresh", { refresh_token: second.refresh_token })).status).toBe(401);
+    // The minted pair is the single live session.
+    const listed = await authed("/auth/sessions", fresh.access_token);
+    expect(listed.status).toBe(200);
+    const sessions = ((await listed.json()) as { sessions: unknown[] }).sessions;
+    expect(sessions).toHaveLength(1);
+    expect((await post("/auth/refresh", { refresh_token: fresh.refresh_token })).status).toBe(200);
+  });
+
+  test("weak new password rejected by the same rule as register (min 8)", async () => {
+    const pair = await registerAndLogin("changepw4@example.com", "old-pass-123");
+    const res = await change(pair.access_token, { currentPassword: "old-pass-123", newPassword: "short" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "weak_password" });
+    expect((await post("/auth/login", { email: "changepw4@example.com", password: "old-pass-123" })).status).toBe(200);
+  });
+
+  test("unauthenticated change → 401 unauthorized", async () => {
+    expect((await change("", { currentPassword: "x", newPassword: "new-pass-456" })).status).toBe(401);
+    const bogus = await change("not-a-token", { currentPassword: "x", newPassword: "new-pass-456" });
+    expect(bogus.status).toBe(401);
+    expect(await bogus.json()).toEqual({ error: "unauthorized" });
   });
 });
