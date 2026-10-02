@@ -82,7 +82,6 @@ function ephemeralSecret(): string {
   }
   return cachedEphemeral;
 }
-
 /** Returns the signing secret, or throws naming JWT_SECRET (never its value). */
 export function getJwtSecret(): string {
   const env = nodeEnv();
@@ -105,6 +104,41 @@ export function getJwtSecret(): string {
     );
   }
   return raw;
+}
+
+export interface JwtRotationKeys {
+  readonly current: string;
+  readonly currentKid: string;
+  readonly previous?: string;
+  readonly previousKid?: string;
+}
+
+function checkRotationSecret(name: "JWT_SECRET_PREVIOUS", raw: string, allowWeak: boolean): void {
+  if (!allowWeak && raw.length < MIN_JWT_SECRET_LEN) {
+    throw new Error(
+      `${name} must be at least ${MIN_JWT_SECRET_LEN} characters (set ALLOW_WEAK_JWT_SECRET=1 only for tests)`,
+    );
+  }
+  if (nodeEnv() === "production" && isSampleSecret(raw)) {
+    throw new Error(
+      `${name} rejects known sample/default/weak values in production (generate a random 32+ char secret)`,
+    );
+  }
+}
+
+export function getJwtRotationKeys(): JwtRotationKeys {
+  const current = getJwtSecret();
+  const allowWeak = process.env["ALLOW_WEAK_JWT_SECRET"] === "1";
+  const currentKid = (process.env["JWT_SECRET_KID"] ?? "").trim() === ""
+    ? "k1"
+    : (process.env["JWT_SECRET_KID"] ?? "").trim();
+  const previousRaw = (process.env["JWT_SECRET_PREVIOUS"] ?? "").trim();
+  if (previousRaw === "") return { current, currentKid };
+  checkRotationSecret("JWT_SECRET_PREVIOUS", previousRaw, allowWeak);
+  const previousKid = (process.env["JWT_SECRET_PREVIOUS_KID"] ?? "").trim() === ""
+    ? "k0"
+    : (process.env["JWT_SECRET_PREVIOUS_KID"] ?? "").trim();
+  return { current, currentKid, previous: previousRaw, previousKid };
 }
 
 export function getAuthPort(): number {

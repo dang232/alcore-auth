@@ -34,6 +34,7 @@ function restoreEnv(): void {
 
 import { describe, test, expect, beforeEach, afterAll, setSystemTime } from "bun:test";
 import { app } from "../src/index";
+import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { resetStoresForTests } from "../src/lib/store";
 
 const LIBRE_REDIRECT = "https://web.alcore.io.vn/auth/callback";
@@ -97,6 +98,8 @@ function fromLocation(location: string): { code: string; state: string } {
 describe("GET /oidc/exchange/redirect — browser handoff", () => {
   beforeEach(() => {
     resetStoresForTests();
+    resetRateLimitsForTests();
+    resetThrottleConnForTests();
     applyRedirectEnv();
   });
 

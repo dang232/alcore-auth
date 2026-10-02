@@ -48,7 +48,7 @@ calls out) for customer provision/backfill/link.
 | GET | `/auth/me` | current user |
 | POST | `/auth/verify/request` `/auth/verify/consume` | email verification (always-200 request) |
 | POST | `/auth/reset/request` `/auth/reset/consume` | password reset (always-200 request) |
-| GET | `/auth/google/callback` | **STUB**: verified-sub only — production MUST verify Google ID tokens server-side |
+| GET | `/auth/google/callback` | authorization-code flow; ID token verified server-side (RS256/JWKS + iss/aud/exp/nonce/email_verified) |
 | GET | `/oidc/authorize` | authorization-code, 60 s single-use codes |
 | POST | `/oidc/token` | code exchange server-side; PKCE S256 optional |
 | POST | `/oidc/exchange` | authenticated request for a short-lived product exchange code |

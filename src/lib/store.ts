@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { getAuthDatabasePath, nodeEnv } from "../config";
+import { verifyPkceS256 } from "./crypto";
 
 export interface User {
   readonly id: string;
@@ -29,6 +30,8 @@ export interface OidcCode {
   readonly clientId: string;
   readonly exp: number;
   used: boolean;
+  readonly codeChallenge: string;
+  readonly codeChallengeMethod: string;
 }
 
 type ProductAudience = "tokenpanel" | "libre";
@@ -78,8 +81,18 @@ db.run(`
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     redirect_uri TEXT NOT NULL,
     client_id TEXT NOT NULL DEFAULT '',
+    code_challenge TEXT NOT NULL DEFAULT '',
+    code_challenge_method TEXT NOT NULL DEFAULT '',
     expires_at INTEGER NOT NULL,
     used INTEGER NOT NULL DEFAULT 0
+  );
+  -- One-use ledger for verify/reset purpose tokens (task 38). Purpose tokens
+  -- are stateless HMAC; this table is what makes consumption single-use: the
+  -- route marks sha256(purpose:token) here inside the consume handler, and a
+  -- replay finds the row already present. Keyed by hash, never the token.
+  CREATE TABLE IF NOT EXISTS consumed_purpose_tokens (
+    token_hash TEXT PRIMARY KEY,
+    consumed_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS product_exchange_codes (
     code_hash TEXT PRIMARY KEY,
@@ -111,6 +124,11 @@ if (!db.query("PRAGMA table_info(oidc_codes)").all().some((column) => {
   return typeof column === "object" && column !== null && "name" in column && column.name === "client_id";
 })) {
   db.run("ALTER TABLE oidc_codes ADD COLUMN client_id TEXT NOT NULL DEFAULT ''");
+}
+// Task 38 PKCE columns for pre-existing file DBs (fresh DBs get them from CREATE TABLE above).
+for (const pkceColumn of ["code_challenge", "code_challenge_method"] as const) {
+  const present = (db.query("PRAGMA table_info(oidc_codes)").all() as Row[]).some((column) => column["name"] === pkceColumn);
+  if (!present) db.run(`ALTER TABLE oidc_codes ADD COLUMN ${pkceColumn} TEXT NOT NULL DEFAULT ''`);
 }
 
 function userFromRow(row: Row | null): User | undefined {
@@ -229,12 +247,27 @@ export const sessionStore = {
   findByRefreshHash(hash: string): Session | undefined {
     return sessionFromRow(db.query("SELECT * FROM sessions WHERE refresh_hash=?").get(hash) as Row | null);
   },
-  rotate(session: Session, nextHash: string): void {
+  findByRefreshOrPrevHash(hash: string): Session | undefined {
+    const live = db.query("SELECT * FROM sessions WHERE refresh_hash=?").get(hash) as Row | null;
+    if (live !== null) return sessionFromRow(live);
+    return sessionFromRow(db.query("SELECT * FROM sessions WHERE previous_hashes LIKE ?").get(`%${hash}%`) as Row | null);
+  },
+  /**
+   * Atomic compare-and-swap rotation: the single UPDATE only wins when the
+   * row still holds the presented hash and is not revoked, so two concurrent
+   * refreshes with the same token yield exactly one winner (mirrors the
+   * oidcStore.consume `UPDATE ... used=0 RETURNING` pattern). Returns true
+   * on win; on loss the in-memory session is left untouched.
+   */
+  rotate(session: Session, nextHash: string): boolean {
+    const merged = [...session.prevHashes, session.refreshHash];
+    const row = db.query(
+      "UPDATE sessions SET refresh_hash=?,previous_hashes=? WHERE id=? AND refresh_hash=? AND revoked=0 RETURNING id",
+    ).get(nextHash, JSON.stringify(merged), session.id, session.refreshHash) as Row | null;
+    if (row === null) return false;
     session.prevHashes.add(session.refreshHash);
     session.refreshHash = nextHash;
-    db.query("UPDATE sessions SET refresh_hash=?,previous_hashes=? WHERE id=? AND revoked=0").run(
-      nextHash, JSON.stringify([...session.prevHashes]), session.id,
-    );
+    return true;
   },
   isReusedHash(session: Session, hash: string): boolean {
     return session.prevHashes.has(hash);
@@ -246,30 +279,73 @@ export const sessionStore = {
   revokeAllForUser(userId: string): void {
     db.query("UPDATE sessions SET revoked=1 WHERE user_id=? AND revoked=0").run(userId);
   },
+  listActiveForUser(userId: string): Session[] {
+    return (db.query("SELECT * FROM sessions WHERE user_id=? AND revoked=0 ORDER BY created_at ASC").all(userId) as Row[])
+      .map((row) => sessionFromRow(row))
+      .filter((s): s is Session => s !== undefined);
+  },
+  revokeByIdForUser(id: string, userId: string): boolean {
+    const result = db.query("UPDATE sessions SET revoked=1 WHERE id=? AND user_id=? AND revoked=0").run(id, userId);
+    return result.changes === 1;
+  },
 };
 
 export const oidcStore = {
-  issue(userId: string, redirectUri: string, clientId: string, ttlSeconds: number): OidcCode {
+  issue(
+    userId: string,
+    redirectUri: string,
+    clientId: string,
+    ttlSeconds: number,
+    pkce?: { readonly challenge: string; readonly method: string },
+  ): OidcCode {
     const record: OidcCode = {
       code: randomHex(16), userId, redirectUri, clientId,
       exp: Math.floor(Date.now() / 1000) + ttlSeconds, used: false,
+      codeChallenge: pkce?.challenge ?? "",
+      codeChallengeMethod: pkce?.method ?? "",
     };
-    db.query("INSERT INTO oidc_codes (code,user_id,redirect_uri,client_id,expires_at,used) VALUES (?,?,?,?,?,0)").run(
-      record.code, record.userId, record.redirectUri, record.clientId, record.exp,
+    db.query("INSERT INTO oidc_codes (code,user_id,redirect_uri,client_id,code_challenge,code_challenge_method,expires_at,used) VALUES (?,?,?,?,?,?,?,0)").run(
+      record.code, record.userId, record.redirectUri, record.clientId,
+      record.codeChallenge, record.codeChallengeMethod, record.exp,
     );
     return record;
   },
-  consume(code: string, redirectUri: string, clientId: string): OidcCode | null {
-    const row = db.query("UPDATE oidc_codes SET used=1 WHERE code=? AND redirect_uri=? AND client_id=? AND expires_at>? AND used=0 RETURNING code,user_id,redirect_uri,client_id,expires_at").get(
+  consume(code: string, redirectUri: string, clientId: string, verifier?: string): OidcCode | null {
+    // PKCE-bound codes require the matching verifier; the check happens BEFORE
+    // the single-use UPDATE so a wrong verifier never burns the code. Codes
+    // issued without a challenge keep the legacy path (verifier ignored).
+    const peek = db.query("SELECT code_challenge FROM oidc_codes WHERE code=?").get(code) as Row | null;
+    if (peek !== null) {
+      const challenge = String(peek["code_challenge"] ?? "");
+      if (challenge !== "") {
+        if (verifier === undefined || verifier === "" || !verifyPkceS256(verifier, challenge)) return null;
+      }
+    }
+    const row = db.query("UPDATE oidc_codes SET used=1 WHERE code=? AND redirect_uri=? AND client_id=? AND expires_at>? AND used=0 RETURNING code,user_id,redirect_uri,client_id,code_challenge,code_challenge_method,expires_at").get(
       code, redirectUri, clientId, Math.floor(Date.now() / 1000),
     ) as Row | null;
     if (row === null) return null;
     return {
       code: String(row["code"]), userId: String(row["user_id"]),
       redirectUri: String(row["redirect_uri"]), clientId: String(row["client_id"]), exp: Number(row["expires_at"]), used: true,
+      codeChallenge: String(row["code_challenge"] ?? ""),
+      codeChallengeMethod: String(row["code_challenge_method"] ?? ""),
     };
   },
 };
+
+/** Single-use ledger for verify/reset purpose tokens (task 38). Returns true
+ *  on first use; false when the token hash is already recorded (replay). */
+export function markPurposeConsumed(tokenHash: string): boolean {
+  try {
+    const result = db.query(
+      "INSERT INTO consumed_purpose_tokens (token_hash,consumed_at) VALUES (?,?) ON CONFLICT(token_hash) DO NOTHING",
+    ).run(tokenHash, Date.now());
+    return result.changes === 1;
+  } catch {
+    return false;
+  }
+}
 
 export const productExchangeStore = {
   issue(userId: string, sessionId: string, audience: ProductAudience, intent: string, ttlSeconds: number): string {
@@ -394,6 +470,7 @@ function randomHex(bytes: number): string {
 }
 
 export function resetStoresForTests(): void {
+  db.run("DELETE FROM consumed_purpose_tokens");
   db.run("DELETE FROM product_exchange_redirects");
   db.run("DELETE FROM google_states");
   db.run("DELETE FROM oidc_codes");

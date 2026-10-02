@@ -34,6 +34,14 @@ services:
       # never a value in this file. Prod boot without it exits 1 (fail-fast,
       # src/config.ts) — that is the intended behavior, not a misconfig.
       JWT_SECRET: ${JWT_SECRET:-}
+      # Rotation passthroughs (optional): empty -> code defaults (kid k1,
+      # no previous key, src/config.ts getJwtRotationKeys). Set during
+      # overlap windows only; never values in this file.
+      JWT_SECRET_KID: ${JWT_SECRET_KID:-}
+      JWT_SECRET_PREVIOUS: ${JWT_SECRET_PREVIOUS:-}
+      JWT_SECRET_PREVIOUS_KID: ${JWT_SECRET_PREVIOUS_KID:-}
+      REDIS_URL: ${REDIS_URL:-}
+      THROTTLE_BACKEND: ${THROTTLE_BACKEND:-}
       # Google passthroughs. Compose only substitutes variables the file
       # references, so an unset key here means a value placed in .env is
       # silently dropped and /auth/google/config keeps answering an empty

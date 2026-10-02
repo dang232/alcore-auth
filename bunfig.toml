@@ -1,0 +1,12 @@
+# Bun configuration for auth-service.
+#
+# Test scoping (task 38): bare `bun test` must discover ONLY the canonical
+# suite under ./tests/. HEAD/ is a git-untracked frozen snapshot referenced
+# hash-identically by docs/auth/CURRENT-STATE.md — it must never be modified,
+# moved, or deleted, so it is excluded here at the mechanism level via the
+# documented `test.pathIgnorePatterns` key (bun v1.4.2;
+# https://bun.sh/docs/runtime/bunfig#test-pathignorepatterns), never by
+# touching files. `bun test ./tests/` behavior is unchanged.
+
+[test]
+pathIgnorePatterns = ["HEAD/**"]

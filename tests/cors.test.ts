@@ -7,9 +7,15 @@ process.env["JWT_SECRET"] = "test-only-dummy-secret-0123456789abcdef";
 process.env["ALLOW_WEAK_JWT_SECRET"] = "1";
 process.env["NODE_ENV"] = "test";
 
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach } from "bun:test";
 import { app } from "../src/index";
+import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { getAllowedOrigins } from "../src/config";
+
+beforeEach(() => {
+  resetRateLimitsForTests();
+  resetThrottleConnForTests();
+});
 
 const GOOD = "https://web.alcore.io.vn";
 const EVIL = "https://evil.example";

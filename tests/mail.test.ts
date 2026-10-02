@@ -23,6 +23,7 @@ import {
   type MailMessage,
 } from "../src/lib/mail";
 import { userStore } from "../src/lib/store";
+import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { getMailConfig } from "../src/config";
 
 const sent: MailMessage[] = [];
@@ -169,6 +170,8 @@ describe("non-enumeration on the purpose-request endpoints", () => {
   beforeEach(() => {
     sent.length = 0;
     resetMailSender();
+    resetRateLimitsForTests();
+    resetThrottleConnForTests();
   });
   afterEach(() => {
     resetMailSender();
