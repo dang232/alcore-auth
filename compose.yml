@@ -40,8 +40,19 @@ services:
       JWT_SECRET_KID: ${JWT_SECRET_KID:-}
       JWT_SECRET_PREVIOUS: ${JWT_SECRET_PREVIOUS:-}
       JWT_SECRET_PREVIOUS_KID: ${JWT_SECRET_PREVIOUS_KID:-}
-      REDIS_URL: ${REDIS_URL:-}
-      THROTTLE_BACKEND: ${THROTTLE_BACKEND:-}
+      # F0 target topology: managed PostgreSQL for identity state.
+      # sqlite (default, empty) keeps the file-backed fallback + auth-data
+      # volume below (rollback path in docs/auth-postgres-cutover.md).
+      # postgres (+ REQUIRED DATABASE_URL) answers every repository call
+      # from PostgreSQL (src/lib/pg-store.ts via Bun's built-in SQL).
+      AUTH_STORE_BACKEND: ${AUTH_STORE_BACKEND:-}
+      DATABASE_URL: ${DATABASE_URL:-}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # S8 deploy gate: this compose file is production (NODE_ENV=production
+      # above), so the throttle default is redis — never silent process-local
+      # memory. Prod boot without REDIS_URL still fails fast naming it
+      # (resolveThrottleBackend in src/lib/ratelimit.ts, wired in src/index.ts).
+      THROTTLE_BACKEND: ${THROTTLE_BACKEND:-redis}
       # Google passthroughs. Compose only substitutes variables the file
       # references, so an unset key here means a value placed in .env is
       # silently dropped and /auth/google/config keeps answering an empty
@@ -57,9 +68,16 @@ services:
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
     # Persist the SQLite identity store across rebuilds. Without this,
     # every image rebuild wipes users/sessions (AUTH_DATABASE_PATH
     # defaults to ./data/auth.sqlite, i.e. /app/data/auth.sqlite here).
+    # KEPT under F0: the volume is the rollback fuel (snapshot ponto in
+    # docs/auth-postgres-cutover.md) even after the backend flips to pg.
     volumes:
       - auth-data:/app/data
     # Shared private network with the TokenPanel Caddy stack so the
@@ -69,8 +87,41 @@ services:
       - alcore-auth-proxy
     restart: unless-stopped
 
+  # F0 target topology substrates (AUTH-owned, identity-only).
+  # db holds users/provider-identities/sessions/OIDC-codes/purpose-ledger/
+  # exchange-codes (src/lib/pg-schema.sql 001). redis holds throttle
+  # counters (auth:* buckets, fail-closed) plus optional revocation cache.
+  # Neither service stores business data — the overbuild gate covers both.
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-auth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-auth}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - alcore-auth-proxy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-auth} -d $${POSTGRES_DB:-auth}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    networks:
+      - alcore-auth-proxy
+    restart: unless-stopped
+
 volumes:
   auth-data:
+  pgdata:
+  redisdata:
 
 networks:
   alcore-auth-proxy:

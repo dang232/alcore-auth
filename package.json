@@ -10,6 +10,7 @@
     "nodemailer": "^10.0.13"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@types/bun": "latest",
     "@types/nodemailer": "^8.0.2"
   }

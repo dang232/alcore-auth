@@ -49,11 +49,11 @@ import { clearAuditForTests, listAuditForTests } from "../src/lib/audit";
 import { resetGoogleJwksCacheForTests } from "../src/lib/google";
 import { baseGoogleClaims, createGoogleTestRig, TEST_GOOGLE_CLIENT_ID } from "./google-jwks-helper";
 
-resetStoresForTests();
+await resetStoresForTests();
 clearAuditForTests();
 
-beforeEach(() => {
-  resetStoresForTests();
+beforeEach(async () => {
+  await resetStoresForTests();
   clearAuditForTests();
   resetRateLimitsForTests();
   resetThrottleConnForTests();
@@ -207,11 +207,11 @@ describe("verification one-use + non-enumeration", () => {
     const b = await post("/auth/verify/request", { email: "lh-ghost@example.com" });
     expect(a.status).toBe(200);
     expect(await a.text()).toBe(await b.text());
-    const user = userStore.findByEmail("lh-v1@example.com");
+    const user = await userStore.findByEmail("lh-v1@example.com");
     expect(user).toBeDefined();
     const token = mintPurposeToken(getJwtSecret(), "verify", user!.id, 3600);
     expect((await post("/auth/verify/consume", { token })).status).toBe(200);
-    expect(userStore.findByEmail("lh-v1@example.com")?.emailVerified).toBe(true);
+    expect((await userStore.findByEmail("lh-v1@example.com"))?.emailVerified).toBe(true);
     const replay = await post("/auth/verify/consume", { token });
     expect(replay.status).toBe(400);
     expect(await replay.json()).toEqual({ error: "invalid_token" });
@@ -535,9 +535,9 @@ describe("OAuth generic errors + conflict audit", () => {
       else process.env["GOOGLE_CLIENT_ID"] = oldId;
     }
     // Conflict: same subject owned by another user → auditable 409.
-    const owner = userStore.create("lh-owner@example.com", null);
-    const other = userStore.create("lh-other@example.com", null);
-    userStore.linkIdentity(owner.id, "google", "lh-conflict-sub");
+    const owner = await userStore.create("lh-owner@example.com", null);
+    const other = await userStore.create("lh-other@example.com", null);
+    await userStore.linkIdentity(owner.id, "google", "lh-conflict-sub");
     const rig2 = createGoogleTestRig();
     const tok2 = rig2.mintIdToken(baseGoogleClaims({ sub: "lh-conflict-sub", email: other.email }));
     const inst2 = rig2.installFetch(tok2);

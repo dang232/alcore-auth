@@ -18,7 +18,7 @@ import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/r
 import { resetStoresForTests, userStore } from "../src/lib/store";
 import { clearAuditForTests, listAuditForTests } from "../src/lib/audit";
 
-resetStoresForTests();
+await resetStoresForTests();
 
 beforeEach(() => {
   resetRateLimitsForTests();
@@ -41,7 +41,7 @@ async function legacyHash(plain: string): Promise<string> {
 
 async function seedLegacyUser(email: string, plain: string): Promise<string> {
   const id = crypto.randomUUID();
-  userStore.createWithId(id, email, await legacyHash(plain), true);
+  await userStore.createWithId(id, email, await legacyHash(plain), true);
   return id;
 }
 
@@ -72,7 +72,7 @@ describe("classifyStoredHash", () => {
 describe("legacy bcrypt login rehash (Auth-only, single write)", () => {
   test("correct bcrypt password logs in and yields exactly one Argon2id hash", async () => {
     const id = await seedLegacyUser("legacy1@example.com", "Legacy-Pw-1!");
-    const before = userStore.findById(id)?.passwordHash ?? "";
+    const before = (await userStore.findById(id))?.passwordHash ?? "";
     expect(before.startsWith("$2b$")).toBe(true);
 
     const res = await post("/auth/login", { email: "legacy1@example.com", password: "Legacy-Pw-1!" });
@@ -83,7 +83,7 @@ describe("legacy bcrypt login rehash (Auth-only, single write)", () => {
 
     // Exactly one stored hash, now canonical Argon2id — the bcrypt value is
     // REPLACED, never kept alongside (no dual storage).
-    const after = userStore.findById(id)?.passwordHash ?? "";
+    const after = (await userStore.findById(id))?.passwordHash ?? "";
     expect(after.startsWith("$argon2id$")).toBe(true);
     expect(after).not.toBe(before);
     expect(listAuditForTests().some((r) => r.event === "auth.password_rehash" && r.outcome === "ok" && r.userId === id)).toBe(true);
@@ -91,12 +91,12 @@ describe("legacy bcrypt login rehash (Auth-only, single write)", () => {
     // The rehashed account logs in again through the canonical path.
     const again = await post("/auth/login", { email: "legacy1@example.com", password: "Legacy-Pw-1!" });
     expect(again.status).toBe(200);
-    expect(userStore.findById(id)?.passwordHash).toBe(after);
+    expect((await userStore.findById(id))?.passwordHash).toBe(after);
   });
 
   test("wrong password fails with zero rehash and identical 401 shape", async () => {
     const id = await seedLegacyUser("legacy2@example.com", "Legacy-Pw-2!");
-    const before = userStore.findById(id)?.passwordHash ?? "";
+    const before = (await userStore.findById(id))?.passwordHash ?? "";
 
     const bad = await post("/auth/login", { email: "legacy2@example.com", password: "Wrong-Pw-xyz" });
     expect(bad.status).toBe(401);
@@ -104,24 +104,24 @@ describe("legacy bcrypt login rehash (Auth-only, single write)", () => {
     expect(unknown.status).toBe(401);
     expect(await bad.json()).toEqual(await unknown.json());
 
-    expect(userStore.findById(id)?.passwordHash).toBe(before);
+    expect((await userStore.findById(id))?.passwordHash).toBe(before);
     expect(listAuditForTests().some((r) => r.event === "auth.password_rehash")).toBe(false);
   });
 
   test("malformed hash fails closed: no access, no rehash, reset-required audit", async () => {
     const id = crypto.randomUUID();
-    userStore.createWithId(id, "broken@example.com", "not-a-bcrypt-hash", true);
+    await userStore.createWithId(id, "broken@example.com", "not-a-bcrypt-hash", true);
 
     const res = await post("/auth/login", { email: "broken@example.com", password: "anything-at-all" });
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "invalid_credentials" });
-    expect(userStore.findById(id)?.passwordHash).toBe("not-a-bcrypt-hash");
+    expect((await userStore.findById(id))?.passwordHash).toBe("not-a-bcrypt-hash");
     expect(listAuditForTests().some((r) => r.event === "auth.login_reset_required" && r.userId === id)).toBe(true);
   });
 
   test("reset-required account recovers through the password-reset flow only", async () => {
     const id = crypto.randomUUID();
-    userStore.createWithId(id, "resetme@example.com", "corrupted-record", true);
+    await userStore.createWithId(id, "resetme@example.com", "corrupted-record", true);
 
     const denied = await post("/auth/login", { email: "resetme@example.com", password: "whatever-123" });
     expect(denied.status).toBe(401);
@@ -132,7 +132,7 @@ describe("legacy bcrypt login rehash (Auth-only, single write)", () => {
 
     const login = await post("/auth/login", { email: "resetme@example.com", password: "Fresh-Pass-99" });
     expect(login.status).toBe(200);
-    expect((userStore.findById(id)?.passwordHash ?? "").startsWith("$argon2id$")).toBe(true);
+    expect(((await userStore.findById(id))?.passwordHash ?? "").startsWith("$argon2id$")).toBe(true);
   });
 
   test("password change accepts a legacy current password and canonicalizes", async () => {
@@ -140,7 +140,7 @@ describe("legacy bcrypt login rehash (Auth-only, single write)", () => {
     const login = await post("/auth/login", { email: "legacy3@example.com", password: "Legacy-Pw-3!" });
     expect(login.status).toBe(200);
     // First login already rehashed; re-seed legacy shape to pin the change path.
-    userStore.setPasswordHash(id, await legacyHash("Legacy-Pw-3!"));
+    await userStore.setPasswordHash(id, await legacyHash("Legacy-Pw-3!"));
     const { access_token } = (await login.json()) as { access_token: string };
 
     const change = await post(
@@ -149,6 +149,6 @@ describe("legacy bcrypt login rehash (Auth-only, single write)", () => {
       { authorization: `Bearer ${access_token}` },
     );
     expect(change.status).toBe(200);
-    expect((userStore.findById(id)?.passwordHash ?? "").startsWith("$argon2id$")).toBe(true);
+    expect(((await userStore.findById(id))?.passwordHash ?? "").startsWith("$argon2id$")).toBe(true);
   });
 });

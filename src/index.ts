@@ -3,6 +3,7 @@ import { cors } from 'hono/cors'
 import { authRoutes } from './routes/auth'
 import { oidcRoutes } from './routes/oidc'
 import { getAuthPort, getBindHost, getJwtSecret, getAllowedOrigins, nodeEnv } from './config'
+import { resolveThrottleBackend } from './lib/ratelimit'
 import { authReadiness } from './lib/readiness'
 
 export const app = new Hono()
@@ -47,8 +48,8 @@ app.get('/health', (c) => {
 })
 // Task 26: readiness with real substrate checks (config + store + signer).
 // Same /health + /health/ready contract the staging runbook health-gates.
-app.get('/health/ready', (c) => {
-  const r = authReadiness()
+app.get('/health/ready', async (c) => {
+  const r = await authReadiness()
   const body = r.ready
     ? { status: 'ok' as const, checks: r.checks, population: r.population, userCount: r.userCount }
     : { status: 'unavailable' as const, checks: r.checks, reasons: r.reasons, population: r.population, userCount: r.userCount }
@@ -61,6 +62,9 @@ function bootConfig(): { port: number; hostname: string } {
   try {
     // Fail-fast: throws naming JWT_SECRET (never its value) when missing/weak in prod.
     getJwtSecret()
+    // S8: production throttle must be Redis-backed — throws naming
+    // THROTTLE_BACKEND / REDIS_URL when unset (never their values).
+    resolveThrottleBackend()
     return { port: getAuthPort(), hostname: getBindHost() }
   } catch (err) {
     console.error(`[auth-service] fatal config: ${err instanceof Error ? err.message : String(err)}`)

@@ -122,10 +122,10 @@ function bearer(c: Context): string {
 // Task 38 one-use purpose tokens: verify the stateless HMAC, then atomically
 // mark sha256(purpose:token) consumed. Replay finds the mark and fails as
 // invalid_token — same shape as a bad token, so no oracle. Null on any failure.
-function consumePurposeOnce(secret: string, purpose: "verify" | "reset", token: string): { userId: string } | null {
+async function consumePurposeOnce(secret: string, purpose: "verify" | "reset", token: string): Promise<{ userId: string } | null> {
   try {
     const { userId } = verifyPurposeToken(secret, purpose, token);
-    if (!markPurposeConsumed(hashToken(`${purpose}:${token}`))) return null;
+    if (!(await markPurposeConsumed(hashToken(`${purpose}:${token}`)))) return null;
     return { userId };
   } catch (e) {
     if (e instanceof TokenError) return null;
@@ -140,12 +140,12 @@ export interface TokenPair {
   expires_in: number;
 }
 
-function issuePair(userId: string): { pair: TokenPair; session: Session } {
+async function issuePair(userId: string): Promise<{ pair: TokenPair; session: Session }> {
   const keys = getJwtRotationKeys();
   const refresh = randomToken(32);
   const sessionId = crypto.randomUUID();
   const access = signAccess({ sub: userId, sid: sessionId, iss: getIssuer(), aud: "auth", intent: "session" }, keys.current, ACCESS_TTL_SECONDS, { kid: keys.currentKid });
-  const session = sessionStore.createWithId(sessionId, userId, hashToken(refresh), REFRESH_TTL_MS);
+  const session = await sessionStore.createWithId(sessionId, userId, hashToken(refresh), REFRESH_TTL_MS);
   return {
     session,
     pair: { access_token: access, refresh_token: refresh, token_type: "Bearer", expires_in: ACCESS_TTL_SECONDS },
@@ -166,8 +166,8 @@ function clearAuthCookies(c: Context): void {
   deleteCookie(c, "alcore_rt", { path: "/" });
 }
 
-function userView(userId: string): { id: string; email: string; emailVerified: boolean } | null {
-  const u = userStore.findById(userId);
+async function userView(userId: string): Promise<{ id: string; email: string; emailVerified: boolean } | null> {
+  const u = await userStore.findById(userId);
   return u === undefined ? null : { id: u.id, email: u.email, emailVerified: u.emailVerified };
 }
 
@@ -187,14 +187,14 @@ authRoutes.post("/register", async (c) => {
     emitAudit("auth.register", "weak_password", { ip: clientIp(c) });
     return c.json({ error: "weak_password" }, 400);
   }
-  if (userStore.findByEmail(email) !== undefined) {
+  if ((await userStore.findByEmail(email)) !== undefined) {
     // Intentional 409 (client needs the outcome to finish signup); login and
     // verify/reset-request surfaces stay non-enumerating (always-401 / always-200).
     emitAudit("auth.register", "email_taken", { ip: clientIp(c) });
     return c.json({ error: "email_taken" }, 409);
   }
-  const user = userStore.create(email, await hashPassword(password));
-  const { pair } = issuePair(user.id);
+  const user = await userStore.create(email, await hashPassword(password));
+  const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
   emitAudit("auth.register", "ok", { userId: user.id, ip: clientIp(c) });
   return c.json({ id: user.id, email: user.email, emailVerified: user.emailVerified, ...pair }, 201);
@@ -206,7 +206,7 @@ authRoutes.post("/login", async (c) => {
   const body = await readJson(c);
   const email = str(body?.["email"]).trim().toLowerCase();
   const password = str(body?.["password"]);
-  const user = EMAIL_RE.test(email) ? userStore.findByEmail(email) : undefined;
+  const user = EMAIL_RE.test(email) ? await userStore.findByEmail(email) : undefined;
   if (user === undefined || user.passwordHash === null) {
     await verifyPassword(password === "" ? "x" : password, DUMMY_HASH);
     emitAudit("auth.login_failed", "invalid_credentials", { ip: clientIp(c) });
@@ -227,10 +227,10 @@ authRoutes.post("/login", async (c) => {
     return c.json(INVALID_CREDENTIALS, 401);
   }
   if (compat === "legacy-ok") {
-    userStore.setPasswordHash(user.id, await hashPassword(password));
+    await userStore.setPasswordHash(user.id, await hashPassword(password));
     emitAudit("auth.password_rehash", "ok", { userId: user.id, ip: clientIp(c) });
   }
-  const { pair } = issuePair(user.id);
+  const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
   emitAudit("auth.login", "ok", { userId: user.id, ip: clientIp(c) });
   return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: user.emailVerified } });
@@ -246,10 +246,10 @@ authRoutes.post("/refresh", async (c) => {
     return c.json({ error: "invalid_grant" }, 401);
   }
   const digest = hashToken(presented);
-  const session = sessionStore.findByRefreshHash(digest);
+  const session = await sessionStore.findByRefreshHash(digest);
   if (session !== undefined && !session.revoked && session.expiresAt > Date.now()) {
     const next = randomToken(32);
-    if (sessionStore.rotate(session, hashToken(next))) {
+    if (await sessionStore.rotate(session, hashToken(next))) {
       const keys = getJwtRotationKeys();
       const access = signAccess(
         { sub: session.userId, sid: session.id, iss: getIssuer(), aud: "auth", intent: "session" },
@@ -270,9 +270,9 @@ authRoutes.post("/refresh", async (c) => {
   }
   // Lost the rotation race, or presented an already-rotated token: either way
   // the digest is now a reuse signal — revoke the whole family (theft signal).
-  const reuse = sessionStore.findByRefreshOrPrevHash(digest);
+  const reuse = await sessionStore.findByRefreshOrPrevHash(digest);
   if (reuse !== undefined && sessionStore.isReusedHash(reuse, digest)) {
-    sessionStore.revokeAllForUser(reuse.userId);
+    await sessionStore.revokeAllForUser(reuse.userId);
     emitAudit("auth.refresh_reuse", "invalid_grant", { userId: reuse.userId, ip: clientIp(c) });
   } else {
     emitAudit("auth.refresh", "invalid_grant", { ip: clientIp(c) });
@@ -285,9 +285,9 @@ authRoutes.post("/logout", async (c) => {
   const body = await readJson(c);
   const byRefresh = str(body?.["refresh_token"]);
   if (byRefresh !== "") {
-    const s = sessionStore.findByRefreshHash(hashToken(byRefresh));
+    const s = await sessionStore.findByRefreshHash(hashToken(byRefresh));
     if (s !== undefined) {
-      sessionStore.revoke(s);
+      await sessionStore.revoke(s);
       emitAudit("auth.logout", "ok", { userId: s.userId, ip: clientIp(c) });
     } else {
       emitAudit("auth.logout", "unknown_session", { ip: clientIp(c) });
@@ -302,8 +302,8 @@ authRoutes.post("/logout", async (c) => {
   }
   try {
     const payload = verifyAccess(token, getJwtRotationKeys(), getIssuer(), "auth", "session");
-    const s = sessionStore.findById(payload.sid);
-    if (s !== undefined) sessionStore.revoke(s);
+    const s = await sessionStore.findById(payload.sid);
+    if (s !== undefined) await sessionStore.revoke(s);
     emitAudit("auth.logout", "ok", { userId: payload.sub, ip: clientIp(c) });
   } catch (e) {
     if (!(e instanceof JwtError)) throw e;
@@ -323,7 +323,7 @@ authRoutes.get("/me", async (c) => {
   }
   try {
     const payload = verifyAccess(token, getJwtRotationKeys(), getIssuer(), "auth", "session");
-    const view = userView(payload.sub);
+    const view = await userView(payload.sub);
     if (view === null) {
       emitAudit("auth.session_read", "unauthorized", { ip: clientIp(c) });
       return c.json({ error: "unauthorized" }, 401);
@@ -338,15 +338,15 @@ authRoutes.get("/me", async (c) => {
 });
 
 // Session revocation contract (task 36b): JSON only, never sets cookies.
-function requireLiveSession(c: Context): { userId: string; sessionId: string } | null {
+async function requireLiveSession(c: Context): Promise<{ userId: string; sessionId: string } | null> {
   const token = bearer(c);
   if (token === "") return null;
   try {
     const payload = verifyAccess(token, getJwtRotationKeys(), getIssuer(), "auth", "session");
-    const s = sessionStore.findById(payload.sid);
+    const s = await sessionStore.findById(payload.sid);
     if (s === undefined || s.revoked || s.expiresAt <= Date.now()) return null;
     if (s.userId !== payload.sub) return null;
-    if (userStore.findById(payload.sub) === undefined) return null;
+    if ((await userStore.findById(payload.sub)) === undefined) return null;
     return { userId: payload.sub, sessionId: payload.sid };
   } catch (e) {
     if (!(e instanceof JwtError)) throw e;
@@ -356,12 +356,12 @@ function requireLiveSession(c: Context): { userId: string; sessionId: string } |
 
 // GET /auth/sessions — list the caller's non-revoked sessions.
 authRoutes.get("/sessions", async (c) => {
-  const caller = requireLiveSession(c);
+  const caller = await requireLiveSession(c);
   if (caller === null) {
     emitAudit("auth.session_list", "unauthorized", { ip: clientIp(c) });
     return c.json({ error: "unauthorized" }, 401);
   }
-  const sessions = sessionStore.listActiveForUser(caller.userId).map((s) => ({
+  const sessions = (await sessionStore.listActiveForUser(caller.userId)).map((s) => ({
     id: s.id,
     createdAt: s.createdAt,
     expiresAt: s.expiresAt,
@@ -373,17 +373,17 @@ authRoutes.get("/sessions", async (c) => {
 
 // DELETE /auth/sessions/:id — revoke one of the caller's sessions by id.
 authRoutes.delete("/sessions/:id", async (c) => {
-  const caller = requireLiveSession(c);
+  const caller = await requireLiveSession(c);
   if (caller === null) {
     emitAudit("auth.session_revoke", "unauthorized", { ip: clientIp(c) });
     return c.json({ error: "unauthorized" }, 401);
   }
   const id = c.req.param("id");
-  if (id === "" || sessionStore.findById(id)?.userId !== caller.userId) {
+  if (id === "" || (await sessionStore.findById(id))?.userId !== caller.userId) {
     emitAudit("auth.session_revoke", "session_not_found", { userId: caller.userId, ip: clientIp(c) });
     return c.json({ error: "session_not_found" }, 404);
   }
-  sessionStore.revokeByIdForUser(id, caller.userId);
+  await sessionStore.revokeByIdForUser(id, caller.userId);
   if (id === caller.sessionId) clearAuthCookies(c);
   emitAudit("auth.session_revoke", "ok", { userId: caller.userId, ip: clientIp(c) });
   return c.json({ ok: true });
@@ -402,7 +402,7 @@ authRoutes.delete("/sessions/:id", async (c) => {
 // session while all other sessions (and replays of old refresh tokens)
 // 401. Tests below pin exactly this behavior.
 authRoutes.post("/change", async (c) => {
-  const caller = requireLiveSession(c);
+  const caller = await requireLiveSession(c);
   if (caller === null) {
     emitAudit("auth.password_change", "unauthorized", { ip: clientIp(c) });
     return c.json({ error: "unauthorized" }, 401);
@@ -414,7 +414,7 @@ authRoutes.post("/change", async (c) => {
     emitAudit("auth.password_change", "weak_password", { userId: caller.userId, ip: clientIp(c) });
     return c.json({ error: "weak_password" }, 400);
   }
-  const user = userStore.findById(caller.userId);
+  const user = await userStore.findById(caller.userId);
   if (user === undefined || user.passwordHash === null) {
     // Google-only (or otherwise passwordless) account: run the same argon2
     // verify path as a real check so 401 latency reveals nothing.
@@ -434,9 +434,9 @@ authRoutes.post("/change", async (c) => {
     }
     return c.json(INVALID_CREDENTIALS, 401);
   }
-  userStore.setPasswordHash(caller.userId, await hashPassword(newPassword));
-  sessionStore.revokeAllForUser(caller.userId);
-  const { pair } = issuePair(caller.userId);
+  await userStore.setPasswordHash(caller.userId, await hashPassword(newPassword));
+  await sessionStore.revokeAllForUser(caller.userId);
+  const { pair } = await issuePair(caller.userId);
   setAuthCookies(c, pair);
   emitAudit("auth.password_change", "ok", { userId: caller.userId, ip: clientIp(c) });
   return c.json({ ok: true, ...pair });
@@ -447,7 +447,7 @@ authRoutes.post("/verify/request", async (c) => {
   const gateVerify = await limitedAsync(c, "verify"); if (gateVerify !== null) return gateVerify;
   const body = await readJson(c);
   const email = str(body?.["email"]).trim().toLowerCase();
-  const user = EMAIL_RE.test(email) ? userStore.findByEmail(email) : undefined;
+  const user = EMAIL_RE.test(email) ? await userStore.findByEmail(email) : undefined;
   if (user !== undefined) {
     // Deliver the minted token; the HTTP surface never reveals existence.
     void deliverPurposeMail(
@@ -481,17 +481,17 @@ authRoutes.get("/verify/consume", (c) => {
 authRoutes.post("/verify/consume", async (c) => {
   const gateVerifyConsume = await limitedAsync(c, "verify"); if (gateVerifyConsume !== null) return gateVerifyConsume;
   const { token } = await readPurposeBody(c);
-  const hit = consumePurposeOnce(getJwtSecret(), "verify", token);
+  const hit = await consumePurposeOnce(getJwtSecret(), "verify", token);
   if (hit === null) {
     emitAudit("auth.verify_consume", "invalid_token", { ip: clientIp(c) });
     return c.json({ error: "invalid_token" }, 400);
   }
-  const user = userStore.findById(hit.userId);
+  const user = await userStore.findById(hit.userId);
   if (user === undefined) {
     emitAudit("auth.verify_consume", "invalid_token", { ip: clientIp(c) });
     return c.json({ error: "invalid_token" }, 400);
   }
-  userStore.setVerified(hit.userId);
+  await userStore.setVerified(hit.userId);
   emitAudit("auth.verify_consume", "ok", { userId: hit.userId, ip: clientIp(c) });
   return c.json({ ok: true });
 });
@@ -501,7 +501,7 @@ authRoutes.post("/reset/request", async (c) => {
   const gateReset = await limitedAsync(c, "reset"); if (gateReset !== null) return gateReset;
   const body = await readJson(c);
   const email = str(body?.["email"]).trim().toLowerCase();
-  const user = EMAIL_RE.test(email) ? userStore.findByEmail(email) : undefined;
+  const user = EMAIL_RE.test(email) ? await userStore.findByEmail(email) : undefined;
   if (user !== undefined) {
     void deliverPurposeMail(
       "reset",
@@ -538,18 +538,18 @@ authRoutes.post("/reset/consume", async (c) => {
     emitAudit("auth.reset_consume", "weak_password", { ip: clientIp(c) });
     return c.json({ error: "weak_password" }, 400);
   }
-  const hit = consumePurposeOnce(getJwtSecret(), "reset", token);
+  const hit = await consumePurposeOnce(getJwtSecret(), "reset", token);
   if (hit === null) {
     emitAudit("auth.reset_consume", "invalid_token", { ip: clientIp(c) });
     return c.json({ error: "invalid_token" }, 400);
   }
-  const user = userStore.findById(hit.userId);
+  const user = await userStore.findById(hit.userId);
   if (user === undefined) {
     emitAudit("auth.reset_consume", "invalid_token", { ip: clientIp(c) });
     return c.json({ error: "invalid_token" }, 400);
   }
-  userStore.setPasswordHash(hit.userId, await hashPassword(newPassword));
-  sessionStore.revokeAllForUser(hit.userId);
+  await userStore.setPasswordHash(hit.userId, await hashPassword(newPassword));
+  await sessionStore.revokeAllForUser(hit.userId);
   emitAudit("auth.reset_consume", "ok", { userId: hit.userId, ip: clientIp(c) });
   return c.json({ ok: true });
 });
@@ -582,25 +582,25 @@ authRoutes.post("/google/verify", async (c) => {
     }
     throw error;
   }
-  const existing = userStore.findByProviderSub("google", profile.subject);
-  const emailUser = userStore.findByEmail(profile.email);
+  const existing = await userStore.findByProviderSub("google", profile.subject);
+  const emailUser = await userStore.findByEmail(profile.email);
   if (existing !== undefined && emailUser !== undefined && existing.id !== emailUser.id) {
     emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
     return c.json({ error: "identity_conflict" }, 409);
   }
-  const user = existing ?? emailUser ?? userStore.create(profile.email, null);
-  userStore.setVerified(user.id);
-  if (userStore.linkIdentity(user.id, "google", profile.subject) === "owned_by_other_user") {
+  const user = existing ?? emailUser ?? (await userStore.create(profile.email, null));
+  await userStore.setVerified(user.id);
+  if ((await userStore.linkIdentity(user.id, "google", profile.subject)) === "owned_by_other_user") {
     emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
     return c.json({ error: "identity_conflict" }, 409);
   }
-  const { pair } = issuePair(user.id);
+  const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
   return c.json({ access_token: pair.access_token });
 });
 
-authRoutes.get("/google/start", (c) => {
+authRoutes.get("/google/start", async (c) => {
   const clientId = getGoogleClientId();
   if (clientId === "") {
     emitAudit("auth.oauth_start", "google_not_configured", { ip: clientIp(c) });
@@ -608,7 +608,7 @@ authRoutes.get("/google/start", (c) => {
   }
   const state = randomToken(24);
   const nonce = randomToken(24);
-  googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+  await googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
   const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   url.search = new URLSearchParams({
     client_id: clientId,
@@ -640,7 +640,7 @@ authRoutes.get("/google/callback", async (c) => {
     emitAudit("auth.oauth_callback", "invalid_google_state", { ip: clientIp(c) });
     return c.json({ error: "invalid_google_state" }, 400);
   }
-  const transaction = googleStateStore.consume(state);
+  const transaction = await googleStateStore.consume(state);
   deleteCookie(c, "alcore_google_state", { path: "/auth/google/callback" });
   if (transaction === null) {
     emitAudit("auth.oauth_callback", "invalid_google_state", { ip: clientIp(c) });
@@ -702,20 +702,20 @@ authRoutes.get("/google/callback", async (c) => {
     }
     throw error;
   }
-  const existing = userStore.findByProviderSub("google", profile.subject);
-  const emailUser = userStore.findByEmail(profile.email);
+  const existing = await userStore.findByProviderSub("google", profile.subject);
+  const emailUser = await userStore.findByEmail(profile.email);
   if (existing !== undefined && emailUser !== undefined && existing.id !== emailUser.id) {
     emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
     return c.json({ error: "identity_conflict" }, 409);
   }
-  const user = existing ?? emailUser ?? userStore.create(profile.email, null);
-  userStore.setVerified(user.id);
-  const linkResult = userStore.linkIdentity(user.id, "google", profile.subject);
+  const user = existing ?? emailUser ?? (await userStore.create(profile.email, null));
+  await userStore.setVerified(user.id);
+  const linkResult = await userStore.linkIdentity(user.id, "google", profile.subject);
   if (linkResult === "owned_by_other_user") {
     emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
     return c.json({ error: "identity_conflict" }, 409);
   }
-  const { pair } = issuePair(user.id);
+  const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
   return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true } });
