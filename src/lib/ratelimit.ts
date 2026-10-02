@@ -96,6 +96,49 @@ export function throttleBackendKind(
 // It is kept ONLY for non-production (dev/test, or THROTTLE_BACKEND unset).
 // Production MUST set THROTTLE_BACKEND=redis + REDIS_URL; restart durability
 // ("restart does not reset budgets") holds only on the Redis path.
+//
+// S8 reconciliation gate: production must never silently fall back to
+// process-local memory. Call resolveThrottleBackend() once at boot (it
+// throws naming THROTTLE_BACKEND / REDIS_URL, never their values); outside
+// production the memory path stays available with an explicit warning.
+
+/** Production gate for throttle backend selection (S8).
+ *
+ *  - Non-production (NODE_ENV anything but "production"): returns the
+ *    existing throttleBackendKind() selection unchanged (memory stays
+ *    available for dev/test ergonomics) and warns when memory is used.
+ *  - Production: REQUIRES THROTTLE_BACKEND=redis AND a non-empty REDIS_URL,
+ *    otherwise throws naming the missing variable(s). Never throws for
+ *    bucket/Lua/fail-closed reasons — those are untouched.
+ *  - Never includes secret values in messages (names only). */
+export function resolveThrottleBackend(
+  env: NodeJS.ProcessEnv = process.env,
+  nodeEnvName?: string,
+): "redis" | "memory" {
+  const node = (nodeEnvName ?? (env["NODE_ENV"] ?? "").trim().toLowerCase()).trim().toLowerCase();
+  if (node !== "production") {
+    const kind = throttleBackendKind(env);
+    if (kind === "memory") {
+      console.warn(
+        "[auth-service] throttle backend=memory (dev/test only; production requires THROTTLE_BACKEND=redis + REDIS_URL)",
+      );
+    }
+    return kind;
+  }
+  const backend = (env["THROTTLE_BACKEND"] ?? "").trim().toLowerCase();
+  const url = (env["REDIS_URL"] ?? "").trim();
+  if (backend !== "redis") {
+    throw new Error(
+      'THROTTLE_BACKEND must be "redis" in production (process-local memory does not span replicas)',
+    );
+  }
+  if (url === "") {
+    throw new Error(
+      "REDIS_URL is required in production when THROTTLE_BACKEND=redis (auth throttle must share counts across replicas)",
+    );
+  }
+  return "redis";
+}
 
 /** Atomic increment-with-TTL contract (one Lua EVAL on real Redis; the
  *  in-test fake implements identical single-step semantics). */
