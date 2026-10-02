@@ -59,6 +59,20 @@ type ParsedAccessPayload = {
 export const JWT_ALG = "HS256";
 export const JWT_TYP = "JWT";
 
+/**
+ * Overlap key set for HS256 secret rotation (task 36b).
+ * Sign ALWAYS with `current`; verify tries `current` first, then `previous`
+ * while it is configured. No `previous` configured = strict single-key.
+ * `kid` binds a token to the key that signed it: a token carrying an unknown
+ * kid rejects even if its signature would verify under a configured secret.
+ */
+export interface JwtKeySet {
+  readonly current: string;
+  readonly currentKid: string;
+  readonly previous?: string;
+  readonly previousKid?: string;
+}
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -96,8 +110,10 @@ export function signAccess(
   },
   secret: string,
   ttlSeconds: number,
+  opts?: { readonly kid?: string },
 ): string {
-  const header = { alg: JWT_ALG, typ: JWT_TYP };
+  const header: Record<string, string> =
+    opts?.kid === undefined || opts.kid === "" ? { alg: JWT_ALG, typ: JWT_TYP } : { alg: JWT_ALG, typ: JWT_TYP, kid: opts.kid };
   const now = Math.floor(Date.now() / 1000);
   const payload: AccessPayload =
     claims.email === undefined || claims.email === ""
@@ -109,15 +125,11 @@ export function signAccess(
 
 export class JwtError extends Error {}
 
-export function verifyAccess(token: string, secret: string, expectedIss: string, expectedAud: string, expectedIntent?: string): AccessPayload {
+export function verifyAccess(token: string, secret: string | JwtKeySet, expectedIss: string, expectedAud: string, expectedIntent?: string): AccessPayload {
   const parts = token.split(".");
   if (parts.length !== 3) throw new JwtError("malformed jwt");
   const [headerEnc, payloadEnc, sig] = parts;
   if (headerEnc === undefined || payloadEnc === undefined || sig === undefined) throw new JwtError("malformed jwt");
-  const expected = signData(`${headerEnc}.${payloadEnc}`, secret);
-  const a = b64UrlDecodeBytes(sig);
-  const b = b64UrlDecodeBytes(expected);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) throw new JwtError("bad signature");
   let header: unknown;
   let payload: unknown;
   try {
@@ -129,6 +141,32 @@ export function verifyAccess(token: string, secret: string, expectedIss: string,
   if (typeof header !== "object" || header === null || !("alg" in header) || header.alg !== JWT_ALG) {
     throw new JwtError("unsupported alg");
   }
+  const tokenKid = "kid" in header && typeof header.kid === "string" && header.kid !== "" ? header.kid : null;
+  const keySet: JwtKeySet =
+    typeof secret === "string" ? { current: secret, currentKid: "" } : secret;
+  if (tokenKid !== null) {
+    const known =
+      (keySet.currentKid !== "" && tokenKid === keySet.currentKid) ||
+      (keySet.previousKid !== undefined && tokenKid === keySet.previousKid);
+    if (!known) throw new JwtError("unknown kid");
+  }
+  const candidates: string[] =
+    tokenKid === null
+      ? (keySet.previous === undefined ? [keySet.current] : [keySet.current, keySet.previous])
+      : tokenKid === keySet.previousKid && keySet.previous !== undefined
+        ? [keySet.previous]
+        : [keySet.current];
+  const data = `${headerEnc}.${payloadEnc}`;
+  const presented = b64UrlDecodeBytes(sig);
+  let signatureOk = false;
+  for (const candidate of candidates) {
+    const expected = b64UrlDecodeBytes(signData(data, candidate));
+    if (presented.length === expected.length && timingSafeEqual(presented, expected)) {
+      signatureOk = true;
+      break;
+    }
+  }
+  if (!signatureOk) throw new JwtError("bad signature");
   if (typeof payload !== "object" || payload === null) throw new JwtError("malformed payload");
   const p = Object.fromEntries(Object.entries(payload));
   if (
@@ -156,6 +194,32 @@ export function verifyAccess(token: string, secret: string, expectedIss: string,
     intent: p.intent,
     ...(typeof p.email === "string" && p.email !== "" ? { email: p.email } : {}),
   } satisfies ParsedAccessPayload;
+}
+
+// --- PKCE (RFC 7636, S256 only — task 38) ---
+//
+// The server enforces S256 when a challenge is presented and rejects `plain`
+// outright (no downgrade). Verifier/challenge shape follows RFC 7636 §4.1:
+// 43–128 chars of [A-Z a-z 0-9 - . _ ~].
+
+const PKCE_TOKEN_RE = /^[A-Za-z0-9\-._~]{43,128}$/;
+
+/** True when the value is a well-formed PKCE verifier/challenge string. */
+export function isValidPkceToken(value: string): boolean {
+  return PKCE_TOKEN_RE.test(value);
+}
+
+/** S256 code_challenge for a verifier: base64url(sha256(verifier)), no padding. */
+export function pkceS256Challenge(verifier: string): string {
+  return Buffer.from(createHash("sha256").update(verifier, "utf8").digest()).toString("base64url");
+}
+
+/** True when sha256(verifier) matches the stored S256 challenge (constant-time). */
+export function verifyPkceS256(verifier: string, challenge: string): boolean {
+  const want = pkceS256Challenge(verifier);
+  const da = createHash("sha256").update(challenge, "utf8").digest();
+  const db = createHash("sha256").update(want, "utf8").digest();
+  return da.length === db.length && timingSafeEqual(da, db);
 }
 
 // --- Stateless single-purpose tokens (verify / reset), HMAC-signed ---
