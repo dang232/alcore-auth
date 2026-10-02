@@ -40,7 +40,7 @@ import { resetStoresForTests } from "../src/lib/store";
 const LIBRE_REDIRECT = "https://web.alcore.io.vn/auth/callback";
 const PANEL_REDIRECT = "https://portal.alcore.io.vn/auth/callback";
 
-resetStoresForTests();
+await resetStoresForTests();
 
 const PASSWORD = "s3cret-pass";
 
@@ -56,8 +56,8 @@ async function sessionFor(email: string): Promise<{ id: string; accessToken: str
   const { userStore, sessionStore } = await import("../src/lib/store");
   const { signAccess, hashToken, randomToken } = await import("../src/lib/crypto");
   const { getJwtSecret, getIssuer } = await import("../src/config");
-  const user = userStore.create(email, "argon2id-test-hash");
-  const session = sessionStore.create(user.id, hashToken(randomToken(32)), 3_600_000);
+  const user = await userStore.create(email, "argon2id-test-hash");
+  const session = await sessionStore.create(user.id, hashToken(randomToken(32)), 3_600_000);
   const accessToken = signAccess(
     { sub: user.id, sid: session.id, iss: getIssuer(), aud: "auth", intent: "session" },
     getJwtSecret(),
@@ -96,8 +96,8 @@ function fromLocation(location: string): { code: string; state: string } {
 }
 
 describe("GET /oidc/exchange/redirect — browser handoff", () => {
-  beforeEach(() => {
-    resetStoresForTests();
+  beforeEach(async () => {
+    await resetStoresForTests();
     resetRateLimitsForTests();
     resetThrottleConnForTests();
     applyRedirectEnv();
@@ -329,9 +329,9 @@ describe("GET /oidc/exchange/redirect — browser handoff", () => {
     const { verifyAccess } = await import("../src/lib/crypto");
     const { getJwtSecret, getIssuer } = await import("../src/config");
     const payload = verifyAccess(accessToken, getJwtSecret(), getIssuer(), "auth", "session");
-    const live = sessionStore.findById(payload.sid);
+    const live = await sessionStore.findById(payload.sid);
     expect(live).toBeDefined();
-    sessionStore.revoke(live!);
+    await sessionStore.revoke(live!);
     const res = await getRedirect(
       { audience: "libre", redirect_uri: LIBRE_REDIRECT, state: "st-revoked" },
       accessToken,

@@ -16,7 +16,7 @@ import { googleStateStore, resetStoresForTests, userStore } from "../src/lib/sto
 import { getIssuer } from "../src/config";
 import { baseGoogleClaims, createGoogleTestRig, TEST_GOOGLE_CLIENT_ID } from "./google-jwks-helper";
 
-resetStoresForTests();
+await resetStoresForTests();
 
 beforeEach(() => {
   resetRateLimitsForTests();
@@ -163,7 +163,7 @@ describe("purpose links reached by GET (as emailed)", () => {
     const id = await registerAndId("getlink2@example.com", "s3cret-pass");
     const token = mintPurposeToken(getJwtSecret(), "verify", id, 3600);
     await app.request(`/auth/verify/consume?token=${encodeURIComponent(token)}`);
-    const user = userStore.findById(id);
+    const user = await userStore.findById(id);
     expect(user?.emailVerified).toBe(false);
   });
 
@@ -173,7 +173,7 @@ describe("purpose links reached by GET (as emailed)", () => {
     await app.request(`/auth/verify/consume?token=${encodeURIComponent(token)}`);
     const res = await postForm("/auth/verify/consume", { token });
     expect(res.status).toBe(200);
-    expect(userStore.findById(id)?.emailVerified).toBe(true);
+    expect((await userStore.findById(id))?.emailVerified).toBe(true);
   });
 
   test("GET /auth/reset/consume renders a password form instead of 404", async () => {
@@ -239,11 +239,11 @@ describe("Google OAuth", () => {
       const res = await post("/auth/google/verify", { idToken: token });
       expect(res.status).toBe(200);
       const body = (await res.json()) as { access_token: string };
-      const user = userStore.findByEmail("google-verify@example.com");
+      const user = await userStore.findByEmail("google-verify@example.com");
       expect(user).toBeDefined();
       expect(verifyAccess(body.access_token, getJwtRotationKeys(), getIssuer(), "auth", "session").sub)
         .toBe(user === undefined ? "missing-user" : user.id);
-      const linkedUser = userStore.findByProviderSub("google", "google-verify-sub");
+      const linkedUser = await userStore.findByProviderSub("google", "google-verify-sub");
       expect(linkedUser?.id).toBe(user?.id);
     } finally {
       restore();
@@ -309,7 +309,7 @@ describe("Google OAuth", () => {
     const nonce = `nonce-${crypto.randomUUID()}`;
     try {
       globalThis.fetch = responder(nonce);
-      googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+      await googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
       return await callback(state, nonce);
     } finally {
       globalThis.fetch = originalFetch;
@@ -362,7 +362,7 @@ describe("Google OAuth", () => {
   });
 
   test("verified Google email links to existing user", async () => {
-    const user = userStore.create("link@example.com", "password-hash");
+    const user = await userStore.create("link@example.com", "password-hash");
     const linkRig = createGoogleTestRig();
     const res = await callbackWithFetch((nonce) => {
       const token = linkRig.mintIdToken(baseGoogleClaims({
@@ -378,9 +378,9 @@ describe("Google OAuth", () => {
   });
 
   test("callback returns 409 when Google identity belongs to another user", async () => {
-    const owner = userStore.create("owner@example.com", null);
-    const another = userStore.create("other@example.com", null);
-    userStore.linkIdentity(owner.id, "google", "google-conflict");
+    const owner = await userStore.create("owner@example.com", null);
+    const another = await userStore.create("other@example.com", null);
+    await userStore.linkIdentity(owner.id, "google", "google-conflict");
     const conflictRig = createGoogleTestRig();
     const res = await callbackWithFetch((nonce) => {
       const token = conflictRig.mintIdToken(baseGoogleClaims({
@@ -512,7 +512,7 @@ describe("OIDC code flow", () => {
     }
     const assertion = exchangedBody.access_token;
     const claims = verifyAccess(assertion, getJwtRotationKeys(), getIssuer(), "tokenpanel", "product_exchange");
-    expect(claims.sub).toBe(userStore.findByEmail("exchange@example.com")?.id ?? "");
+    expect(claims.sub).toBe((await userStore.findByEmail("exchange@example.com"))?.id ?? "");
     expect(claims.email).toBe("exchange@example.com");
     expect(claims.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
     expect(() => verifyAccess(assertion, getJwtRotationKeys(), getIssuer(), "libre")).toThrow();

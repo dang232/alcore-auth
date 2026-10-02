@@ -20,6 +20,30 @@ export function getAuthDatabasePath(): string {
   if (nodeEnv() === "test") return ":memory:";
   return (process.env["AUTH_DATABASE_PATH"] ?? DEFAULT_AUTH_DATABASE_PATH).trim();
 }
+
+// F0 backend selection. "postgres" answers every repository call from
+// managed PostgreSQL (target topology); anything else (default) keeps the
+// file-backed SQLite fallback. Case-insensitive, whitespace-tolerant.
+export type AuthStoreBackend = "sqlite" | "postgres";
+
+export function getAuthStoreBackend(): AuthStoreBackend {
+  return (process.env["AUTH_STORE_BACKEND"] ?? "").trim().toLowerCase() === "postgres"
+    ? "postgres"
+    : "sqlite";
+}
+
+/**
+ * PostgreSQL connection string for the postgres backend. Required (fail-fast,
+ * naming DATABASE_URL — never its value) exactly when the postgres backend
+ * is selected; unread otherwise so SQLite-only deploys need no new secret.
+ */
+export function getDatabaseUrl(): string {
+  const raw = (process.env["DATABASE_URL"] ?? "").trim();
+  if (raw === "" && getAuthStoreBackend() === "postgres") {
+    throw new Error("DATABASE_URL is required when AUTH_STORE_BACKEND=postgres (use a postgres:// connection string)");
+  }
+  return raw;
+}
 export const DEFAULT_ISSUER = "https://auth.alcore.io.vn";
 
 const DEFAULT_ALLOWED_ORIGINS: string[] = [

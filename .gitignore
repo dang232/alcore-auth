@@ -15,4 +15,8 @@ coverage/
 # logs
 *.log
 
+# F0 auth snapshots contain secret material (password/refresh hashes, live
+# codes) — chmod 600 at creation, never commit, never paste into logs.
+*.auth-snapshot.json
+
 data/

@@ -178,7 +178,7 @@ describe("non-enumeration on the purpose-request endpoints", () => {
   });
 
   test("verify/request answers 200 for a real account with mail unconfigured", async () => {
-    const user = userStore.create("known@example.com", "hash");
+    const user = await userStore.create("known@example.com", "hash");
     const res = await request("/auth/verify/request", "known@example.com");
     expect(res.status).toBe(200);
     expect(user.id).not.toBe("");

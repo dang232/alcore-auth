@@ -30,16 +30,16 @@ async function limitedAsync(c: Context, scope: string): Promise<Response | null>
   return c.json(g.body, g.status as 429 | 503);
 }
 
-function bearerSub(c: Context): string | null {
+async function bearerSub(c: Context): Promise<string | null> {
   const h = c.req.header("authorization") ?? "";
   const m = /^Bearer (.+)$/.exec(h.trim());
   const token = m?.[1]?.trim() ?? "";
   if (token === "") return null;
   try {
     const payload = verifyAccess(token, getJwtRotationKeys(), getIssuer(), "auth", "session");
-    const session = sessionStore.findById(payload.sid);
+    const session = await sessionStore.findById(payload.sid);
     if (session === undefined || session.revoked || session.expiresAt <= Date.now() || session.userId !== payload.sub) return null;
-    return userStore.findById(payload.sub) === undefined ? null : payload.sub;
+    return (await userStore.findById(payload.sub)) === undefined ? null : payload.sub;
   } catch (e) {
     if (!(e instanceof JwtError)) throw e;
     return null;
@@ -64,7 +64,7 @@ export const oidcRoutes = new Hono();
 // must be redeemed with the matching code_verifier at POST /oidc/token.
 oidcRoutes.get("/authorize", async (c) => {
   const gateOidc = await limitedAsync(c, "oidc"); if (gateOidc !== null) return gateOidc;
-  const sub = bearerSub(c);
+  const sub = await bearerSub(c);
   if (sub === null) {
     emitAudit("auth.oidc_authorize", "unauthorized", { ip: clientIp(c) });
     return c.json({ error: "unauthorized" }, 401);
@@ -91,7 +91,7 @@ oidcRoutes.get("/authorize", async (c) => {
       return c.json({ error: "invalid_pkce_method" }, 400);
     }
   }
-  const rec = oidcStore.issue(
+  const rec = await oidcStore.issue(
     sub, redirectUri, clientId, CODE_TTL_SECONDS,
     challenge === "" ? undefined : { challenge, method: "S256" },
   );
@@ -129,13 +129,13 @@ oidcRoutes.post("/token", async (c) => {
     emitAudit("auth.oidc_token", "invalid_grant", { clientId, ip: clientIp(c) });
     return c.json({ error: "invalid_grant" }, 400);
   }
-  const rec = oidcStore.consume(code, redirectUri, clientId, verifier);
+  const rec = await oidcStore.consume(code, redirectUri, clientId, verifier);
   if (rec === null) {
     emitAudit("auth.oidc_token", "invalid_grant", { clientId, ip: clientIp(c) });
     return c.json({ error: "invalid_grant" }, 400);
   }
   emitAudit("auth.oidc_token", "ok", { userId: rec.userId, clientId, ip: clientIp(c) });
-  const session = sessionStore.create(rec.userId, hashToken(randomToken(32)), REFRESH_TTL_MS);
+  const session = await sessionStore.create(rec.userId, hashToken(randomToken(32)), REFRESH_TTL_MS);
   const keys = getJwtRotationKeys();
   const access = signAccess(
     { sub: rec.userId, sid: session.id, iss: getIssuer(), aud: clientId, intent: "oidc" },
@@ -155,7 +155,7 @@ const PRODUCT_INTENT = "product_exchange";
 
 oidcRoutes.post("/exchange", async (c) => {
   const gateExchange = await limitedAsync(c, "exchange"); if (gateExchange !== null) return gateExchange;
-  const sub = bearerSub(c);
+  const sub = await bearerSub(c);
   if (sub === null) {
     emitAudit("auth.exchange_request", "unauthorized", { ip: clientIp(c) });
     return c.json({ error: "unauthorized" }, 401);
@@ -189,12 +189,12 @@ oidcRoutes.post("/exchange", async (c) => {
     }
     throw error;
   }
-  const session = sessionStore.findById(payload.sid);
+  const session = await sessionStore.findById(payload.sid);
   if (session === undefined || session.revoked || session.expiresAt <= Date.now() || session.userId !== payload.sub || sub !== payload.sub) {
     emitAudit("auth.exchange_request", "unauthorized", { userId: sub, ip: clientIp(c) });
     return c.json({ error: "unauthorized" }, 401);
   }
-  const code = productExchangeStore.issue(sub, payload.sid, audience, PRODUCT_INTENT, PRODUCT_EXCHANGE_TTL_SECONDS);
+  const code = await productExchangeStore.issue(sub, payload.sid, audience, PRODUCT_INTENT, PRODUCT_EXCHANGE_TTL_SECONDS);
   emitAudit("auth.exchange_request", "ok", { userId: sub, ip: clientIp(c) });
   return c.json({ code, expires_in: PRODUCT_EXCHANGE_TTL_SECONDS });
 });
@@ -205,16 +205,16 @@ oidcRoutes.post("/exchange", async (c) => {
  * revoked-or-expired rejection, so a cookie session is exactly as strict as a
  * Bearer session.
  */
-function cookieSession(c: Context): { userId: string; sessionId: string } | null {
+async function cookieSession(c: Context): Promise<{ userId: string; sessionId: string } | null> {
   const token = getCookie(c, "alcore_at") ?? "";
   if (token === "") return null;
   try {
     const payload = verifyAccess(token, getJwtRotationKeys(), getIssuer(), "auth", "session");
-    const session = sessionStore.findById(payload.sid);
+    const session = await sessionStore.findById(payload.sid);
     if (session === undefined || session.revoked || session.expiresAt <= Date.now() || session.userId !== payload.sub) {
       return null;
     }
-    if (userStore.findById(payload.sub) === undefined) return null;
+    if ((await userStore.findById(payload.sub)) === undefined) return null;
     return { userId: payload.sub, sessionId: payload.sid };
   } catch (e) {
     if (!(e instanceof JwtError)) throw e;
@@ -252,12 +252,12 @@ oidcRoutes.get("/exchange/redirect", async (c) => {
     emitAudit("auth.exchange_request", "invalid_redirect_uri", { ip: clientIp(c) });
     return c.json({ error: "invalid_redirect_uri" }, 400);
   }
-  const session = cookieSession(c);
+  const session = await cookieSession(c);
   if (session === null) {
     emitAudit("auth.exchange_request", "unauthorized", { ip: clientIp(c) });
     return c.json({ error: "unauthorized" }, 401);
   }
-  const code = productExchangeStore.issueForRedirect(
+  const code = await productExchangeStore.issueForRedirect(
     session.userId,
     session.sessionId,
     audience,
@@ -294,23 +294,23 @@ oidcRoutes.post("/exchange/token", async (c) => {
   const redirectUri = "redirect_uri" in request ? request["redirect_uri"] : "";
   const state = "state" in request ? request["state"] : "";
   const exchange = typeof redirectUri === "string" && redirectUri !== ""
-    ? productExchangeStore.consumeForRedirect(
+    ? await productExchangeStore.consumeForRedirect(
         code, audience, PRODUCT_INTENT, redirectUri,
         typeof state === "string" ? state : "",
       )
-    : productExchangeStore.consume(code, audience, PRODUCT_INTENT);
+    : await productExchangeStore.consume(code, audience, PRODUCT_INTENT);
   if (exchange === null) {
     emitAudit("auth.exchange_token", "invalid_grant", { ip: clientIp(c) });
     return c.json({ error: "invalid_grant" }, 400);
   }
-  const session = sessionStore.findById(exchange.sessionId);
+  const session = await sessionStore.findById(exchange.sessionId);
   if (session === undefined || session.revoked || session.expiresAt <= Date.now() || session.userId !== exchange.userId) {
     emitAudit("auth.exchange_token", "invalid_grant", { userId: exchange.userId, ip: clientIp(c) });
     return c.json({ error: "invalid_grant" }, 400);
   }
   // The consuming product provisions its own profile and needs the verified
   // address to do so. The assertion stays server-to-server and short-lived.
-  const exchangedUser = userStore.findById(exchange.userId);
+  const exchangedUser = await userStore.findById(exchange.userId);
   const exchangeKeys = getJwtRotationKeys();
   const token = signAccess({
     sub: exchange.userId, sid: exchange.sessionId, iss: getIssuer(), aud: exchange.audience, intent: exchange.intent,

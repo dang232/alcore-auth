@@ -15,7 +15,7 @@ import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/r
 import { googleStateStore, resetStoresForTests, userStore } from "../src/lib/store";
 import { baseGoogleClaims, createGoogleTestRig, TEST_GOOGLE_CLIENT_ID } from "./google-jwks-helper";
 
-resetStoresForTests();
+await resetStoresForTests();
 
 beforeEach(() => {
   resetRateLimitsForTests();
@@ -50,9 +50,9 @@ describe("todo35: JWKS happy path resolves one identity", () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as { access_token: string };
       expect(typeof body.access_token).toBe("string");
-      const user = userStore.findByEmail(email);
+      const user = await userStore.findByEmail(email);
       expect(user?.emailVerified).toBe(true);
-      expect(userStore.findByProviderSub("google", sub)?.id).toBe(user?.id);
+      expect((await userStore.findByProviderSub("google", sub))?.id).toBe(user?.id);
     } finally {
       restore();
     }
@@ -67,12 +67,12 @@ describe("todo35: JWKS happy path resolves one identity", () => {
     try {
       const r1 = await post("/auth/google/verify", { idToken: first });
       expect(r1.status).toBe(200);
-      const id1 = userStore.findByProviderSub("google", sub)?.id ?? "";
+      const id1 = (await userStore.findByProviderSub("google", sub))?.id ?? "";
       const secondRig = rig.installFetch(second);
       const r2 = await post("/auth/google/verify", { idToken: second });
       secondRig.restore();
       expect(r2.status).toBe(200);
-      expect(userStore.findByProviderSub("google", sub)?.id).toBe(id1);
+      expect((await userStore.findByProviderSub("google", sub))?.id).toBe(id1);
     } finally {
       restore();
     }
@@ -86,7 +86,7 @@ describe("todo35: JWKS happy path resolves one identity", () => {
     const { restore } = rig.installFetch(token);
     try {
       const state = `st-${crypto.randomUUID()}`;
-      googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+      await googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
       const res = await app.request(
         `/auth/google/callback?state=${encodeURIComponent(state)}&code=test-code`,
         { headers: { cookie: `alcore_google_state=${state}` } },
@@ -94,7 +94,7 @@ describe("todo35: JWKS happy path resolves one identity", () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as { user: { id: string; emailVerified: boolean } };
       expect(body.user.emailVerified).toBe(true);
-      expect(body.user.id).toBe(userStore.findByEmail(email)?.id ?? "");
+      expect(body.user.id).toBe((await userStore.findByEmail(email))?.id ?? "");
     } finally {
       restore();
     }
@@ -123,7 +123,7 @@ describe("todo35: JWKS happy path resolves one identity", () => {
     }) as typeof globalThis.fetch;
     try {
       const state = `st-${crypto.randomUUID()}`;
-      googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+      await googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
       const res = await app.request(
         `/auth/google/callback?state=${encodeURIComponent(state)}&code=test-code`,
         { headers: { cookie: `alcore_google_state=${state}` } },
@@ -139,10 +139,10 @@ describe("todo35: JWKS happy path resolves one identity", () => {
 describe("todo35: conflicts are auditable 409s, never silent merges", () => {
   test("different-email same-sub conflict returns 409 identity_conflict", async () => {
     const rig = createGoogleTestRig();
-    const owner = userStore.create(uniqueEmail("owner"), null);
-    userStore.linkIdentity(owner.id, "google", "conflict-sub-35");
+    const owner = await userStore.create(uniqueEmail("owner"), null);
+    await userStore.linkIdentity(owner.id, "google", "conflict-sub-35");
     const otherEmail = uniqueEmail("other");
-    userStore.create(otherEmail, null);
+    await userStore.create(otherEmail, null);
     const token = rig.mintIdToken(baseGoogleClaims({ sub: "conflict-sub-35", email: otherEmail }));
     const { restore } = rig.installFetch(token);
     try {
@@ -150,7 +150,7 @@ describe("todo35: conflicts are auditable 409s, never silent merges", () => {
       expect(res.status).toBe(409);
       expect(await res.json()).toEqual({ error: "identity_conflict" });
       // Neither row was merged: owner keeps the subject, other keeps no link.
-      expect(userStore.findByProviderSub("google", "conflict-sub-35")?.id).toBe(owner.id);
+      expect((await userStore.findByProviderSub("google", "conflict-sub-35"))?.id).toBe(owner.id);
     } finally {
       restore();
     }
@@ -301,7 +301,7 @@ describe("todo35: adversarial negatives fail closed with generic errors", () => 
     try {
       const state = `st-${crypto.randomUUID()}`;
       const nonce = `nonce-${crypto.randomUUID()}`;
-      googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+      await googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
       const res = await app.request(
         `/auth/google/callback?state=${encodeURIComponent(state)}&code=test-code`,
         { headers: { cookie: `alcore_google_state=${state}` } },
@@ -320,7 +320,7 @@ describe("todo35: adversarial negatives fail closed with generic errors", () => 
     const { restore } = rig.installFetch(token);
     try {
       const state = `st-${crypto.randomUUID()}`;
-      googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
+      await googleStateStore.issue(state, nonce, Math.floor(Date.now() / 1000) + 300);
       const url = `/auth/google/callback?state=${encodeURIComponent(state)}&code=test-code`;
       const first = await app.request(url, { headers: { cookie: `alcore_google_state=${state}` } });
       expect(first.status).toBe(200);

@@ -223,14 +223,14 @@ describe("kid overlap (OIDC)", () => {
 });
 
 describe("atomic refresh rotation", () => {
-  test("stale in-memory session loses CAS (deterministic lost-race unit)", () => {
-    const created = userStore.create(`${TAG}-cas-user@example.com`, null);
-    const first = sessionStore.create(created.id, hashToken(`${TAG}-cas-first`), 3600_000);
-    const staleView = sessionStore.findById(first.id);
+  test("stale in-memory session loses CAS (deterministic lost-race unit)", async () => {
+    const created = await userStore.create(`${TAG}-cas-user@example.com`, null);
+    const first = await sessionStore.create(created.id, hashToken(`${TAG}-cas-first`), 3600_000);
+    const staleView = await sessionStore.findById(first.id);
     expect(staleView !== undefined).toBe(true);
-    expect(sessionStore.rotate(first, hashToken(`${TAG}-cas-second`))).toBe(true);
-    expect(sessionStore.rotate(staleView ?? first, hashToken(`${TAG}-cas-third`))).toBe(false);
-    expect(sessionStore.findById(first.id)?.refreshHash).toBe(hashToken(`${TAG}-cas-second`));
+    expect(await sessionStore.rotate(first, hashToken(`${TAG}-cas-second`))).toBe(true);
+    expect(await sessionStore.rotate(staleView ?? first, hashToken(`${TAG}-cas-third`))).toBe(false);
+    expect((await sessionStore.findById(first.id))?.refreshHash).toBe(hashToken(`${TAG}-cas-second`));
   });
 
   test("concurrent double-refresh yields exactly one winner; loser revokes family", async () => {

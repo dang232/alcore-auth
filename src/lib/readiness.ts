@@ -37,7 +37,9 @@ export interface ReadinessDeps {
   readonly resolveIssuer: () => string;
   readonly probeStore: () => boolean;
   readonly roundTripSigner: (secret: string, issuer: string) => boolean;
-  readonly countUsers: () => number;
+  // Sync or async: the SQLite backend answers synchronously, PostgreSQL
+  // (F0 target) answers via a Promise. Awaited either way.
+  readonly countUsers: () => number | Promise<number>;
 }
 
 /** Isolated substrate cells — never in the user/session/OIDC namespaces. */
@@ -66,7 +68,7 @@ const defaultDeps: ReadinessDeps = {
   countUsers: () => userStore.count(),
 };
 
-export function authReadiness(deps: ReadinessDeps = defaultDeps): AuthReadiness {
+export async function authReadiness(deps: ReadinessDeps = defaultDeps): Promise<AuthReadiness> {
   const checks: Record<"config" | "store" | "signer", ProbeOutcome> = {
     config: "down",
     store: "down",
@@ -102,7 +104,7 @@ export function authReadiness(deps: ReadinessDeps = defaultDeps): AuthReadiness 
   let userCount: number | null = null;
   let population: PopulationState = "unknown";
   try {
-    userCount = deps.countUsers();
+    userCount = await deps.countUsers();
     population = userCount > 0 ? "populated" : "empty";
   } catch {
     population = "unknown";

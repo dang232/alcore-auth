@@ -1,49 +1,54 @@
+// ALcore Auth Repo C — identity stores with pluggable backend (F0).
+//
+// SQLite below is the BATTLE-TESTED fallback/test backend (file-backed
+// ./data/auth.sqlite + WAL + auth-data volume; durable single-node, task36
+// restart proof). The target topology is managed PostgreSQL
+// (src/lib/pg-store.ts over Bun's built-in SQL client, DATABASE_URL).
+//
+// Backend selection (src/config.ts): AUTH_STORE_BACKEND=postgres (+ required
+// DATABASE_URL) answers every repository call from PostgreSQL; anything else
+// answers from SQLite. Tests may inject a query connection via
+// __setPgConnForTests (PGlite proof harness) which takes precedence.
+//
+// Interface contract: the exported stores implement src/lib/auth-models.ts
+// (same names, args, return shapes — Promise-based because PG I/O is async;
+// SQLite answers synchronously under the hood). Routes import these stable
+// names and observe zero behavior change across backends. Rollback = config
+// flip back to SQLite (cutover runbook in docs/auth-postgres-cutover.md).
+
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { getAuthDatabasePath, nodeEnv } from "../config";
+import { getAuthDatabasePath, getAuthStoreBackend, getDatabaseUrl, nodeEnv } from "../config";
 import { verifyPkceS256 } from "./crypto";
+import type {
+  GoogleStateStore,
+  OidcCode,
+  OidcStore,
+  ProductAudience,
+  ProductExchangeCode,
+  ProductExchangeStore,
+  Session,
+  SessionStore,
+  User,
+  UserStore,
+} from "./auth-models";
+import { bunSqlConn, createPgStores, type PgConn, type PgStores } from "./pg-store";
 
-export interface User {
-  readonly id: string;
-  readonly email: string;
-  readonly passwordHash: string | null;
-  readonly emailVerified: boolean;
-  readonly createdAt: string;
-}
-
-export interface Session {
-  readonly id: string;
-  readonly userId: string;
-  refreshHash: string;
-  prevHashes: Set<string>;
-  readonly createdAt: number;
-  readonly expiresAt: number;
-  revoked: boolean;
-}
-
-export interface OidcCode {
-  readonly code: string;
-  readonly userId: string;
-  readonly redirectUri: string;
-  readonly clientId: string;
-  readonly exp: number;
-  used: boolean;
-  readonly codeChallenge: string;
-  readonly codeChallengeMethod: string;
-}
-
-type ProductAudience = "tokenpanel" | "libre";
-
-export interface ProductExchangeCode {
-  readonly code: string;
-  readonly userId: string;
-  readonly sessionId: string;
-  readonly audience: ProductAudience;
-  readonly intent: string;
-  readonly exp: number;
-}
+export type {
+  GoogleStateStore,
+  IdentityLinkResult,
+  OidcCode,
+  OidcStore,
+  ProductAudience,
+  ProductExchangeCode,
+  ProductExchangeStore,
+  Session,
+  SessionStore,
+  User,
+  UserStore,
+} from "./auth-models";
 
 type Row = Record<string, unknown>;
 
@@ -155,7 +160,7 @@ function sessionFromRow(row: Row | null): Session | undefined {
   };
 }
 
-export const userStore = {
+const sqliteUserStore = {
   create(email: string, passwordHash: string | null): User {
     const user: User = {
       id: crypto.randomUUID(),
@@ -217,7 +222,7 @@ export const userStore = {
   },
 };
 
-export const sessionStore = {
+const sqliteSessionStore = {
   create(userId: string, refreshHash: string, ttlMs: number): Session {
     const now = Date.now();
     const session: Session = {
@@ -290,7 +295,7 @@ export const sessionStore = {
   },
 };
 
-export const oidcStore = {
+const sqliteOidcStore = {
   issue(
     userId: string,
     redirectUri: string,
@@ -336,7 +341,7 @@ export const oidcStore = {
 
 /** Single-use ledger for verify/reset purpose tokens (task 38). Returns true
  *  on first use; false when the token hash is already recorded (replay). */
-export function markPurposeConsumed(tokenHash: string): boolean {
+function sqliteMarkPurposeConsumed(tokenHash: string): boolean {
   try {
     const result = db.query(
       "INSERT INTO consumed_purpose_tokens (token_hash,consumed_at) VALUES (?,?) ON CONFLICT(token_hash) DO NOTHING",
@@ -347,7 +352,7 @@ export function markPurposeConsumed(tokenHash: string): boolean {
   }
 }
 
-export const productExchangeStore = {
+const sqliteProductExchangeStore = {
   issue(userId: string, sessionId: string, audience: ProductAudience, intent: string, ttlSeconds: number): string {
     const code = randomHex(32);
     const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
@@ -448,7 +453,7 @@ function hashExchangeCode(code: string): string {
   return createHash("sha256").update(code).digest("hex");
 }
 
-export const googleStateStore = {
+const sqliteGoogleStateStore = {
   issue(state: string, nonce: string, exp: number): void {
     db.query("DELETE FROM google_states WHERE expires_at <= ?").run(Math.floor(Date.now() / 1000));
     db.query("INSERT INTO google_states(state,nonce,expires_at) VALUES (?,?,?)").run(state, nonce, exp);
@@ -461,15 +466,7 @@ export const googleStateStore = {
   },
 };
 
-function randomHex(bytes: number): string {
-  const buffer = new Uint8Array(bytes);
-  crypto.getRandomValues(buffer);
-  let hex = "";
-  for (const byte of buffer) hex += byte.toString(16).padStart(2, "0");
-  return hex;
-}
-
-export function resetStoresForTests(): void {
+function sqliteResetStoresForTests(): void {
   db.run("DELETE FROM consumed_purpose_tokens");
   db.run("DELETE FROM product_exchange_redirects");
   db.run("DELETE FROM google_states");
@@ -480,4 +477,177 @@ export function resetStoresForTests(): void {
   db.run("DELETE FROM users");
 }
 
-if (nodeEnv() === "test") resetStoresForTests();
+// ---------------------------------------------------------------------------
+// F0 backend delegation. The SQLite objects above stay the fallback; the
+// PostgreSQL objects come from createPgStores. Every exported store answers
+// from exactly one backend per call, chosen by usePostgres().
+// ---------------------------------------------------------------------------
+
+let testPgConn: PgConn | null = null;
+let pgCache: PgStores | null = null;
+
+/**
+ * Test-only: inject a query connection (PGlite harness) so the whole suite
+ * can run against PostgreSQL semantics in-process. Takes precedence over
+ * AUTH_STORE_BACKEND. Pass null to restore env-based selection.
+ */
+export function __setPgConnForTests(conn: PgConn | null): void {
+  pgCache = null;
+  testPgConn = conn;
+}
+
+function pgStores(): PgStores {
+  if (pgCache === null) pgCache = createPgStores(testPgConn ?? bunSqlConn(getDatabaseUrl()));
+  return pgCache;
+}
+
+function usePostgres(): boolean {
+  if (testPgConn !== null) return true;
+  try {
+    return getAuthStoreBackend() === "postgres";
+  } catch {
+    return false;
+  }
+}
+
+export const userStore: UserStore = {
+  create: (email, passwordHash) =>
+    usePostgres() ? pgStores().userStore.create(email, passwordHash) : Promise.resolve(sqliteUserStore.create(email, passwordHash)),
+  createWithId: (id, email, passwordHash, emailVerified) =>
+    usePostgres()
+      ? pgStores().userStore.createWithId(id, email, passwordHash, emailVerified)
+      : Promise.resolve(sqliteUserStore.createWithId(id, email, passwordHash, emailVerified)),
+  findByEmail: (email) =>
+    usePostgres() ? pgStores().userStore.findByEmail(email) : Promise.resolve(sqliteUserStore.findByEmail(email)),
+  findByProviderSub: (provider, sub) =>
+    usePostgres()
+      ? pgStores().userStore.findByProviderSub(provider, sub)
+      : Promise.resolve(sqliteUserStore.findByProviderSub(provider, sub)),
+  linkIdentity: (userId, provider, sub) =>
+    usePostgres()
+      ? pgStores().userStore.linkIdentity(userId, provider, sub)
+      : Promise.resolve(sqliteUserStore.linkIdentity(userId, provider, sub)),
+  findById: (id) =>
+    usePostgres() ? pgStores().userStore.findById(id) : Promise.resolve(sqliteUserStore.findById(id)),
+  findByIdAndPasswordHash: (id, passwordHash) =>
+    usePostgres()
+      ? pgStores().userStore.findByIdAndPasswordHash(id, passwordHash)
+      : Promise.resolve(sqliteUserStore.findByIdAndPasswordHash(id, passwordHash)),
+  setVerified: (id) =>
+    usePostgres() ? pgStores().userStore.setVerified(id) : Promise.resolve(sqliteUserStore.setVerified(id)),
+  setPasswordHash: (id, hash) =>
+    usePostgres() ? pgStores().userStore.setPasswordHash(id, hash) : Promise.resolve(sqliteUserStore.setPasswordHash(id, hash)),
+  count: () =>
+    usePostgres() ? pgStores().userStore.count() : Promise.resolve(sqliteUserStore.count()),
+};
+
+export const sessionStore: SessionStore = {
+  create: (userId, refreshHash, ttlMs) =>
+    usePostgres()
+      ? pgStores().sessionStore.create(userId, refreshHash, ttlMs)
+      : Promise.resolve(sqliteSessionStore.create(userId, refreshHash, ttlMs)),
+  createWithId: (id, userId, refreshHash, ttlMs) =>
+    usePostgres()
+      ? pgStores().sessionStore.createWithId(id, userId, refreshHash, ttlMs)
+      : Promise.resolve(sqliteSessionStore.createWithId(id, userId, refreshHash, ttlMs)),
+  findById: (id) =>
+    usePostgres() ? pgStores().sessionStore.findById(id) : Promise.resolve(sqliteSessionStore.findById(id)),
+  findByRefreshHash: (hash) =>
+    usePostgres()
+      ? pgStores().sessionStore.findByRefreshHash(hash)
+      : Promise.resolve(sqliteSessionStore.findByRefreshHash(hash)),
+  findByRefreshOrPrevHash: (hash) =>
+    usePostgres()
+      ? pgStores().sessionStore.findByRefreshOrPrevHash(hash)
+      : Promise.resolve(sqliteSessionStore.findByRefreshOrPrevHash(hash)),
+  rotate: (session, nextHash) =>
+    usePostgres()
+      ? pgStores().sessionStore.rotate(session, nextHash)
+      : Promise.resolve(sqliteSessionStore.rotate(session, nextHash)),
+  isReusedHash: (session, hash) =>
+    // Pure in-memory predicate — identical on both backends by construction.
+    sqliteSessionStore.isReusedHash(session, hash),
+  revoke: (session) =>
+    usePostgres() ? pgStores().sessionStore.revoke(session) : Promise.resolve(sqliteSessionStore.revoke(session)),
+  revokeAllForUser: (userId) =>
+    usePostgres()
+      ? pgStores().sessionStore.revokeAllForUser(userId)
+      : Promise.resolve(sqliteSessionStore.revokeAllForUser(userId)),
+  listActiveForUser: (userId) =>
+    usePostgres()
+      ? pgStores().sessionStore.listActiveForUser(userId)
+      : Promise.resolve(sqliteSessionStore.listActiveForUser(userId)),
+  revokeByIdForUser: (id, userId) =>
+    usePostgres()
+      ? pgStores().sessionStore.revokeByIdForUser(id, userId)
+      : Promise.resolve(sqliteSessionStore.revokeByIdForUser(id, userId)),
+};
+
+export const oidcStore: OidcStore = {
+  issue: (userId, redirectUri, clientId, ttlSeconds, pkce) =>
+    usePostgres()
+      ? pgStores().oidcStore.issue(userId, redirectUri, clientId, ttlSeconds, pkce)
+      : Promise.resolve(sqliteOidcStore.issue(userId, redirectUri, clientId, ttlSeconds, pkce)),
+  consume: (code, redirectUri, clientId, verifier) =>
+    usePostgres()
+      ? pgStores().oidcStore.consume(code, redirectUri, clientId, verifier)
+      : Promise.resolve(sqliteOidcStore.consume(code, redirectUri, clientId, verifier)),
+};
+
+/** Single-use ledger for verify/reset purpose tokens (task 38). Returns true
+ *  on first use; false when the token hash is already recorded (replay). */
+export function markPurposeConsumed(tokenHash: string): Promise<boolean> {
+  return usePostgres()
+    ? pgStores().purposeLedger.markPurposeConsumed(tokenHash)
+    : Promise.resolve(sqliteMarkPurposeConsumed(tokenHash));
+}
+
+export const productExchangeStore: ProductExchangeStore = {
+  issue: (userId, sessionId, audience, intent, ttlSeconds) =>
+    usePostgres()
+      ? pgStores().productExchangeStore.issue(userId, sessionId, audience, intent, ttlSeconds)
+      : Promise.resolve(sqliteProductExchangeStore.issue(userId, sessionId, audience, intent, ttlSeconds)),
+  issueForRedirect: (userId, sessionId, audience, intent, redirectUri, state, ttlSeconds) =>
+    usePostgres()
+      ? pgStores().productExchangeStore.issueForRedirect(userId, sessionId, audience, intent, redirectUri, state, ttlSeconds)
+      : Promise.resolve(
+        sqliteProductExchangeStore.issueForRedirect(userId, sessionId, audience, intent, redirectUri, state, ttlSeconds),
+      ),
+  consume: (code, audience, intent) =>
+    usePostgres()
+      ? pgStores().productExchangeStore.consume(code, audience, intent)
+      : Promise.resolve(sqliteProductExchangeStore.consume(code, audience, intent)),
+  consumeForRedirect: (code, audience, intent, redirectUri, state) =>
+    usePostgres()
+      ? pgStores().productExchangeStore.consumeForRedirect(code, audience, intent, redirectUri, state)
+      : Promise.resolve(
+        sqliteProductExchangeStore.consumeForRedirect(code, audience, intent, redirectUri, state),
+      ),
+};
+
+export const googleStateStore: GoogleStateStore = {
+  issue: (state, nonce, exp) =>
+    usePostgres()
+      ? pgStores().googleStateStore.issue(state, nonce, exp)
+      : Promise.resolve(sqliteGoogleStateStore.issue(state, nonce, exp)),
+  consume: (state) =>
+    usePostgres()
+      ? pgStores().googleStateStore.consume(state)
+      : Promise.resolve(sqliteGoogleStateStore.consume(state)),
+};
+
+function randomHex(bytes: number): string {
+  const buffer = new Uint8Array(bytes);
+  crypto.getRandomValues(buffer);
+  let hex = "";
+  for (const byte of buffer) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+export function resetStoresForTests(): Promise<void> {
+  if (usePostgres()) return pgStores().resetStoresForTests();
+  sqliteResetStoresForTests();
+  return Promise.resolve();
+}
+
+if (nodeEnv() === "test") void resetStoresForTests();

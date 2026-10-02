@@ -50,8 +50,8 @@ describe("GET /health/ready", () => {
     );
   });
 
-  test("failing config short-circuits to 503 with reasons (fail-closed)", () => {
-    const r = authReadiness({
+  test("failing config short-circuits to 503 with reasons (fail-closed)", async () => {
+    const r = await authReadiness({
       resolveSecret: () => {
         throw new Error("JWT_SECRET is required in production");
       },
@@ -65,8 +65,8 @@ describe("GET /health/ready", () => {
     expect(r.reasons).toContain("config_unavailable");
   });
 
-  test("unwritable store maps to 503 store_unwritable", () => {
-    const r = authReadiness({
+  test("unwritable store maps to 503 store_unwritable", async () => {
+    const r = await authReadiness({
       resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
       resolveIssuer: () => "https://auth.alcore.io.vn",
       probeStore: () => false,
@@ -78,8 +78,8 @@ describe("GET /health/ready", () => {
     expect(r.reasons).toContain("store_unwritable");
   });
 
-  test("broken signer maps to 503 signer_failed", () => {
-    const r = authReadiness({
+  test("broken signer maps to 503 signer_failed", async () => {
+    const r = await authReadiness({
       resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
       resolveIssuer: () => "https://auth.alcore.io.vn",
       probeStore: () => true,
@@ -93,8 +93,8 @@ describe("GET /health/ready", () => {
     expect(r.reasons).toContain("signer_failed");
   });
 
-  test("empty user table reports population=empty but stays ready", () => {
-    const r = authReadiness({
+  test("empty user table reports population=empty but stays ready", async () => {
+    const r = await authReadiness({
       resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
       resolveIssuer: () => "https://auth.alcore.io.vn",
       probeStore: () => true,
@@ -106,8 +106,8 @@ describe("GET /health/ready", () => {
     expect(r.ready).toBe(true);
   });
 
-  test("seeded user table reports population=populated with the count", () => {
-    const r = authReadiness({
+  test("seeded user table reports population=populated with the count", async () => {
+    const r = await authReadiness({
       resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
       resolveIssuer: () => "https://auth.alcore.io.vn",
       probeStore: () => true,
@@ -118,8 +118,8 @@ describe("GET /health/ready", () => {
     expect(r.userCount).toBe(12);
   });
 
-  test("a failing count degrades to unknown and never flips readiness", () => {
-    const r = authReadiness({
+  test("a failing count degrades to unknown and never flips readiness", async () => {
+    const r = await authReadiness({
       resolveSecret: () => "test-only-dummy-secret-0123456789abcdef",
       resolveIssuer: () => "https://auth.alcore.io.vn",
       probeStore: () => true,
