@@ -30,6 +30,11 @@ services:
       # dev, src/config.ts). Production sets the explicit triangle
       # (https://web.alcore.io.vn,https://alcore.io.vn,https://auth.alcore.io.vn).
       AUTH_ALLOWED_ORIGINS: ${AUTH_ALLOWED_ORIGINS:-}
+      # OIDC client registration: exact redirect URIs per product
+      # (e.g. libre=https://web.alcore.io.vn/auth/alcore/callback).
+      # Required for /oidc/exchange/redirect; missing entry fails closed
+      # with invalid_redirect_uri. Same silent-drop rule as Google keys above.
+      AUTH_OIDC_CLIENTS: ${AUTH_OIDC_CLIENTS:-}
       # REQUIRED-empty passthrough: forwarded from the owner's host env,
       # never a value in this file. Prod boot without it exits 1 (fail-fast,
       # src/config.ts) — that is the intended behavior, not a misconfig.
