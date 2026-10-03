@@ -54,6 +54,49 @@ function redirectOrigin(url: string): string | null {
   }
 }
 
+function escHtml(v: string): string {
+  return v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Browser-friendly errors for GET /exchange/redirect only: top-level
+// navigations without a session (e.g. a stray bookmark or a client that
+// navigated before signing in) would otherwise render raw JSON. API and
+// test callers send no `Accept: text/html`, so they keep the JSON shape.
+function exchangeRedirectError(
+  c: Context,
+  status: 400 | 401,
+  errorCode: string,
+  userMessage: string,
+  auditEvent: string,
+): Response {
+  emitAudit("auth.exchange_request", auditEvent, { ip: clientIp(c) });
+  const accept = c.req.header("accept") ?? "";
+  if (!accept.includes("text/html")) return c.json({ error: errorCode }, status);
+  const heading = auditEvent === "unauthorized" ? "Sign-in required" : "Sign-in request invalid";
+  return c.html(
+    `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escHtml(heading)}</title>
+<style>
+body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:2rem 1rem;background:#f6f7f9;color:#111}
+main{max-width:26rem;margin:0 auto;background:#fff;padding:1.5rem;border:1px solid #e3e5e8;border-radius:.5rem}
+h1{font-size:1.25rem;margin:0 0 .5rem}
+p{margin:0 0 1rem;color:#444}
+code{font-size:.875rem;color:#666}
+a{display:inline-block;margin-top:.5rem;color:#111;font-weight:600}
+</style>
+</head>
+<body><main><h1>${escHtml(heading)}</h1><p>${escHtml(userMessage)}</p><p><code>${escHtml(errorCode)}</code></p>
+<a href="https://web.alcore.io.vn/login">Return to login</a>
+</main></body>
+</html>`,
+    status,
+  );
+}
+
 export const oidcRoutes = new Hono();
 
 // GET /oidc/authorize?response_type=code&client_id=..&redirect_uri=..&state=..
@@ -237,25 +280,21 @@ oidcRoutes.get("/exchange/redirect", async (c) => {
   const redirectUri = c.req.query("redirect_uri") ?? "";
   const state = c.req.query("state") ?? "";
   if (audience !== "tokenpanel" && audience !== "libre") {
-    emitAudit("auth.exchange_request", "invalid_audience", { ip: clientIp(c) });
-    return c.json({ error: "invalid_audience" }, 400);
+    return exchangeRedirectError(c, 400, "invalid_audience", "Invalid app request.", "invalid_audience");
   }
   // State is the browser's CSRF binding, echoed back unchanged. Refusing an empty
   // one stops a caller from silently degrading its own CSRF protection.
   if (state === "" || state.length > 512) {
-    emitAudit("auth.exchange_request", "invalid_state", { ip: clientIp(c) });
-    return c.json({ error: "invalid_state" }, 400);
+    return exchangeRedirectError(c, 400, "invalid_state", "Invalid sign-in request. Please restart sign-in.", "invalid_state");
   }
   const origin = redirectOrigin(redirectUri);
   const registered = [...getOidcClients().values()].includes(redirectUri);
   if (redirectUri === "" || !registered || origin === null || !getAllowedOrigins().includes(origin)) {
-    emitAudit("auth.exchange_request", "invalid_redirect_uri", { ip: clientIp(c) });
-    return c.json({ error: "invalid_redirect_uri" }, 400);
+    return exchangeRedirectError(c, 400, "invalid_redirect_uri", "This app is not registered. Contact support.", "invalid_redirect_uri");
   }
   const session = await cookieSession(c);
   if (session === null) {
-    emitAudit("auth.exchange_request", "unauthorized", { ip: clientIp(c) });
-    return c.json({ error: "unauthorized" }, 401);
+    return exchangeRedirectError(c, 401, "unauthorized", "Sign-in required. Please return to login and sign in first.", "unauthorized");
   }
   const code = await productExchangeStore.issueForRedirect(
     session.userId,
