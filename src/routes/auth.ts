@@ -7,7 +7,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { setCookie, deleteCookie, getCookie } from "hono/cookie";
-import { getGoogleClientId, getGoogleRedirectUri, getJwtSecret, getIssuer, getJwtRotationKeys } from "../config";
+import { getGoogleClientId, getGoogleRedirectUri, getJwtSecret, getIssuer, getJwtRotationKeys, getOidcClients, getAllowedOrigins } from "../config";
 import {
   hashPassword,
   verifyPassword,
@@ -20,7 +20,7 @@ import {
   JwtError,
   TokenError,
 } from "../lib/crypto";
-import { googleStateStore, markPurposeConsumed, userStore, sessionStore } from "../lib/store";
+import { googleStateStore, markPurposeConsumed, productExchangeStore, userStore, sessionStore } from "../lib/store";
 import { verifyPasswordCompat } from "../lib/legacy-password";
 import { emitAudit } from "../lib/audit";
 import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential } from "../lib/google";
@@ -600,6 +600,41 @@ authRoutes.post("/google/verify", async (c) => {
   return c.json({ access_token: pair.access_token });
 });
 
+// Google → product handoff (e.g. Libre full-page Google login chaining back).
+// Local mirrors of oidc.ts PRODUCT_INTENT / PRODUCT_EXCHANGE_TTL_SECONDS:
+// kept as literals here to minimize cross-file churn; if oidc.ts changes
+// these values, update both sites together.
+const GOOGLE_RETURN_INTENT = "product_exchange";
+const GOOGLE_RETURN_CODE_TTL_SECONDS = 60;
+const GOOGLE_RETURN_COOKIE = "alcore_google_return";
+const GOOGLE_RETURN_COOKIE_PATH = "/auth/google/callback";
+
+function googleReturnOrigin(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+// Same allowlist as GET /oidc/exchange/redirect: exact registered redirect_uri
+// AND origin in AUTH_ALLOWED_ORIGINS, audience in [libre, tokenpanel],
+// state 1..512 chars. Returns the validated triple or null with a reason.
+function validateGoogleReturnHandoff(
+  audience: string,
+  redirectUri: string,
+  state: string,
+): { audience: string; redirectUri: string; state: string } | { error: string } {
+  if (audience !== "libre" && audience !== "tokenpanel") return { error: "invalid_audience" };
+  if (state === "" || state.length > 512) return { error: "invalid_state" };
+  const origin = googleReturnOrigin(redirectUri);
+  const registered = [...getOidcClients().values()].includes(redirectUri);
+  if (redirectUri === "" || !registered || origin === null || !getAllowedOrigins().includes(origin)) {
+    return { error: "invalid_redirect_uri" };
+  }
+  return { audience, redirectUri, state };
+}
+
 authRoutes.get("/google/start", async (c) => {
   const clientId = getGoogleClientId();
   if (clientId === "") {
@@ -622,6 +657,19 @@ authRoutes.get("/google/start", async (c) => {
   setCookie(c, "alcore_google_state", state, {
     httpOnly: true, secure: true, sameSite: "Lax", path: "/auth/google/callback", maxAge: 300,
   });
+  const handoffAudience = c.req.query("audience") ?? "";
+  const handoffRedirectUri = c.req.query("redirect_uri") ?? "";
+  const handoffState = c.req.query("state") ?? "";
+  if (handoffAudience !== "" || handoffRedirectUri !== "" || handoffState !== "") {
+    const handoff = validateGoogleReturnHandoff(handoffAudience, handoffRedirectUri, handoffState);
+    if ("error" in handoff) {
+      emitAudit("auth.oauth_start", "invalid_request", { ip: clientIp(c) });
+      return c.json({ error: "invalid_request" }, 400);
+    }
+    setCookie(c, GOOGLE_RETURN_COOKIE, JSON.stringify({ audience: handoff.audience, redirect_uri: handoff.redirectUri, state: handoff.state }), {
+      httpOnly: true, secure: true, sameSite: "Lax", path: GOOGLE_RETURN_COOKIE_PATH, maxAge: 300,
+    });
+  }
   emitAudit("auth.oauth_start", "ok", { ip: clientIp(c) });
   return c.redirect(url.toString(), 302);
 });
@@ -715,8 +763,47 @@ authRoutes.get("/google/callback", async (c) => {
     emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
     return c.json({ error: "identity_conflict" }, 409);
   }
-  const { pair } = await issuePair(user.id);
+  const { pair, session } = await issuePair(user.id);
   setAuthCookies(c, pair);
+  const returnRaw = getCookie(c, GOOGLE_RETURN_COOKIE) ?? "";
+  if (returnRaw !== "") {
+    deleteCookie(c, GOOGLE_RETURN_COOKIE, { path: GOOGLE_RETURN_COOKIE_PATH });
+    let handoff: { audience?: unknown; redirect_uri?: unknown; state?: unknown } | null = null;
+    try {
+      const parsed: unknown = JSON.parse(returnRaw);
+      if (typeof parsed === "object" && parsed !== null) {
+        handoff = parsed as { audience?: unknown; redirect_uri?: unknown; state?: unknown };
+      }
+    } catch {
+      handoff = null;
+    }
+    if (handoff !== null) {
+      const validated = validateGoogleReturnHandoff(
+        String(handoff.audience ?? ""),
+        String(handoff.redirect_uri ?? ""),
+        String(handoff.state ?? ""),
+      );
+      if (!("error" in validated)) {
+        const code = await productExchangeStore.issueForRedirect(
+          user.id,
+          session.id,
+          validated.audience,
+          GOOGLE_RETURN_INTENT,
+          validated.redirectUri,
+          validated.state,
+          GOOGLE_RETURN_CODE_TTL_SECONDS,
+        );
+        const sep = validated.redirectUri.includes("?") ? "&" : "?";
+        emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
+        return c.redirect(
+          `${validated.redirectUri}${sep}code=${encodeURIComponent(code)}&state=${encodeURIComponent(validated.state)}`,
+          302,
+        );
+      }
+      emitAudit("auth.oauth_callback", "invalid_request", { userId: user.id, ip: clientIp(c) });
+      return c.json({ error: "invalid_request" }, 400);
+    }
+  }
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
   return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true } });
 });
