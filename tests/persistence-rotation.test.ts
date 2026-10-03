@@ -119,7 +119,10 @@ describe("durable browser transactions", () => {
 describe("identity-only boundary", () => {
   test("store.ts owns no business tables or entities", () => {
     const src = readFileSync(new URL("../src/lib/store.ts", import.meta.url), "utf8");
-    const tables = [...src.matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
+    // Ledger DDL is authored in provision-ledger-schema.ts (todo 7) and
+    // applied by store.ts at import; scan both so the boundary sees it.
+    const ledger = readFileSync(new URL("../src/lib/provision-ledger-schema.ts", import.meta.url), "utf8");
+    const tables = [...(src + ledger).matchAll(/CREATE TABLE IF NOT EXISTS (\w+)/g)].map((m) => m[1]);
     expect(tables.sort()).toEqual(
       [
         "consumed_purpose_tokens",
@@ -128,6 +131,7 @@ describe("identity-only boundary", () => {
         "product_exchange_codes",
         "product_exchange_redirects",
         "provider_identities",
+        "provisioning_ledger",
         "sessions",
         "users",
       ].sort(),

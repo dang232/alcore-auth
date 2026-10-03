@@ -443,6 +443,7 @@ export function createPgStores(conn: PgConn): PgStores {
   };
 
   async function resetStoresForTests(): Promise<void> {
+    await conn.query("DELETE FROM provisioning_ledger");
     await conn.query("DELETE FROM consumed_purpose_tokens");
     await conn.query("DELETE FROM product_exchange_redirects");
     await conn.query("DELETE FROM google_states");

@@ -20,6 +20,7 @@ export const AUTH_TABLES = [
   "product_exchange_codes",
   "product_exchange_redirects",
   "google_states",
+  "provisioning_ledger",
 ] as const;
 
 export type AuthTable = (typeof AUTH_TABLES)[number];
@@ -49,6 +50,8 @@ export function canonicalRow(table: AuthTable, row: PgRow): string {
       return JSON.stringify([s(row["code_hash"]), s(row["redirect_uri"]), s(row["state_hash"]), n(row["expires_at"])]);
     case "google_states":
       return JSON.stringify([h(row["state"]), h(row["nonce"]), n(row["expires_at"])]);
+    case "provisioning_ledger":
+      return JSON.stringify([s(row["canonical_key"]), s(row["auth_user_id"]), s(row["product"]), s(row["state"]), n(row["created_at"]), n(row["updated_at"])]);
   }
 }
 
@@ -119,6 +122,7 @@ const RESTORE_ORDER: AuthTable[] = [
   "oidc_codes",
   "consumed_purpose_tokens",
   "google_states",
+  "provisioning_ledger",
 ];
 
 export async function restoreFromFile(conn: PgConn, inPath: string): Promise<Map<AuthTable, PgRow[]>> {

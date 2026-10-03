@@ -35,6 +35,7 @@ import type {
   UserStore,
 } from "./auth-models";
 import { bunSqlConn, createPgStores, type PgConn, type PgStores } from "./pg-store";
+import { PROVISION_LEDGER_SQLITE_DDL } from "./provision-ledger-schema";
 
 export type {
   GoogleStateStore,
@@ -125,6 +126,10 @@ db.run(`
   );
   CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
 `);
+// Provisioning ledger (unified-auth-core todo 7): pull-lazy per-product state
+// machine. DDL author is provision-ledger-schema.ts; applied here so every
+// backend (file SQLite, :memory: tests) carries it from import time.
+db.exec(PROVISION_LEDGER_SQLITE_DDL);
 if (!db.query("PRAGMA table_info(oidc_codes)").all().some((column) => {
   return typeof column === "object" && column !== null && "name" in column && column.name === "client_id";
 })) {
@@ -467,6 +472,7 @@ const sqliteGoogleStateStore = {
 };
 
 function sqliteResetStoresForTests(): void {
+  db.run("DELETE FROM provisioning_ledger");
   db.run("DELETE FROM consumed_purpose_tokens");
   db.run("DELETE FROM product_exchange_redirects");
   db.run("DELETE FROM google_states");
