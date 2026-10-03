@@ -61,17 +61,10 @@ export function getGoogleRedirectUri(): string {
   return (process.env["GOOGLE_REDIRECT_URI"] ?? `${getIssuer()}/auth/google/callback`).trim();
 }
 
-export function getProvisionConfig(): Readonly<{
-  readonly url: string;
-  readonly key: string;
-  readonly organizationId: string;
-}> {
-  return {
-    url: (process.env["TOKENPANEL_PROVISION_URL"] ?? "").trim().replace(/\/+$/, ""),
-    key: (process.env["TOKENPANEL_PROVISION_KEY"] ?? "").trim(),
-    organizationId: (process.env["TOKENPANEL_ORGANIZATION_ID"] ?? "").trim(),
-  };
-}
+// NOTE (unified-auth-core todo 10): Auth is who-only and NEVER calls products.
+// The former TOKENPANEL_PROVISION_* push-client config was removed here:
+// zero references in src/compose, zero fetch() to any product. Products pull
+// Auth proof instead — see docs/pull-provision-contract.md.
 
 const SAMPLE_SECRETS = new Set([
   "changeme",
