@@ -37,6 +37,8 @@ if (explicitUrl !== "") {
   close = () => db.close();
   const schema = readFileSync(join(import.meta.dir, "..", "src", "lib", "pg-schema.sql"), "utf8");
   await db.exec(schema);
+  const schema002 = readFileSync(join(import.meta.dir, "..", "src", "lib", "pg-schema-002-provisioning-ledger.sql"), "utf8");
+  await db.exec(schema002);
 }
 
 try {
