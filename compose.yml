@@ -69,8 +69,17 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-}
     depends_on:
+      # Local `db` is OPTIONAL: production may run sqlite fallback (default,
+      # empty AUTH_STORE_BACKEND) or an external/managed PostgreSQL via
+      # DATABASE_URL (e.g. VPS auth-pg-1). A crash-looping local `db` (notably
+      # missing POSTGRES_PASSWORD on a fresh volume) must never block `auth`
+      # startup — see VPS outage where auth-auth-1 stayed Created behind
+      # auth-db-1 Restarting. `required: false` keeps the healthy-db wait but
+      # lets `auth` start when `db` is absent/unhealthy. Redis stays required:
+      # production throttle is redis-backed and fail-closed without it.
       db:
         condition: service_healthy
+        required: false
       redis:
         condition: service_started
     # Persist the SQLite identity store across rebuilds. Without this,
