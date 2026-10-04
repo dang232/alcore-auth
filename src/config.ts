@@ -189,8 +189,21 @@ export function getAllowedOrigins(): string[] {
     .filter((s) => s !== "");
 }
 
+const DEFAULT_OIDC_CLIENTS: ReadonlyMap<string, string> = new Map([
+  ["tokenpanel", "https://alcore.io.vn/portal/auth/callback"],
+]);
+
 export function getOidcClients(): ReadonlyMap<string, string> {
   const raw = process.env["AUTH_OIDC_CLIENTS"] ?? "";
+  // Empty (prod compose passes AUTH_OIDC_CLIENTS through empty) falls back
+  // to the committed portal default, mirroring how getAllowedOrigins falls
+  // back to DEFAULT_ALLOWED_ORIGINS (whose https://alcore.io.vn entry is the
+  // other half of the redirect check). The portal callback URI is built by
+  // authCallbackRedirectUri() in AlRepo apps/portal/src/api/authExchange.ts
+  // (`<origin>/portal/auth/callback`). Inert for self-hosted: one extra
+  // exact-URI allowlist entry grants nothing unless the deploy serves that
+  // origin. An explicit AUTH_OIDC_CLIENTS replaces (not merges) this.
+  if (raw.trim() === "") return new Map(DEFAULT_OIDC_CLIENTS);
   return new Map(raw.split(",").flatMap((entry) => {
     const separator = entry.indexOf("=");
     const clientId = entry.slice(0, separator).trim();
