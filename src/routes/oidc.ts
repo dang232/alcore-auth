@@ -6,7 +6,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { getCookie } from "hono/cookie";
-import { getIssuer, getAllowedOrigins, getOidcClients, getJwtRotationKeys } from "../config";
+import { getIssuer, getAllowedOrigins, getOidcClients, getJwtRotationKeys, getSupportUrl } from "../config";
 import { hashToken, randomToken, verifyAccess, signAccess, JwtError, isValidPkceToken } from "../lib/crypto";
 import { oidcStore, productExchangeStore, sessionStore, userStore } from "../lib/store";
 import { limitedAsync as throttleGuard } from "../lib/ratelimit";
@@ -62,17 +62,48 @@ function escHtml(v: string): string {
 // navigations without a session (e.g. a stray bookmark or a client that
 // navigated before signing in) would otherwise render raw JSON. API and
 // test callers send no `Accept: text/html`, so they keep the JSON shape.
+//
+// R6: the HTML page carries a per-error "Restart sign-in" deep-link that
+// preserves audience/redirect_uri/state, plus a request-id for support.
+// The restart link is rendered ONLY when redirect_uri passes the same
+// allowlist check as the handoff itself (exact registered URI + allowed
+// origin); otherwise it would be an open redirector, so unvalidated URIs
+// (notably invalid_redirect_uri) get login + request-id instead.
+// R34: the invalid_redirect_uri page echoes the client (audience) and the
+// attempted redirect target plus the support URL as ticket context. The
+// allowlist itself stays operator-manual — no endpoint edits it.
 function exchangeRedirectError(
   c: Context,
   status: 400 | 401,
   errorCode: string,
   userMessage: string,
   auditEvent: string,
+  opts?: { audience?: string; redirectUri?: string; state?: string },
 ): Response {
+  const requestId = crypto.randomUUID();
   emitAudit("auth.exchange_request", auditEvent, { ip: clientIp(c) });
   const accept = c.req.header("accept") ?? "";
   if (!accept.includes("text/html")) return c.json({ error: errorCode }, status);
   const heading = auditEvent === "unauthorized" ? "Sign-in required" : "Sign-in request invalid";
+  const audience = opts?.audience ?? "";
+  const redirectUri = opts?.redirectUri ?? "";
+  const state = opts?.state ?? "";
+  const origin = redirectOrigin(redirectUri);
+  const restartable =
+    redirectUri !== "" &&
+    [...getOidcClients().values()].includes(redirectUri) &&
+    origin !== null &&
+    getAllowedOrigins().includes(origin);
+  const params = new URLSearchParams();
+  if (audience !== "") params.set("audience", audience);
+  if (restartable) params.set("redirect_uri", redirectUri);
+  if (state !== "" && state.length <= 512) params.set("state", state);
+  const restartHref = restartable ? `/oidc/exchange/redirect?${params.toString()}` : null;
+  const supportUrl = getSupportUrl();
+  const contextRows =
+    auditEvent === "invalid_redirect_uri"
+      ? `<p><code>client ${escHtml(audience === "" ? "(unknown)" : audience)} &middot; redirect ${escHtml(redirectUri === "" ? "(missing)" : redirectUri)}</code></p>`
+      : `<p><code>${escHtml(errorCode)}</code></p>`;
   return c.html(
     `<!doctype html>
 <html lang="en">
@@ -89,7 +120,10 @@ code{font-size:.875rem;color:#666}
 a{display:inline-block;margin-top:.5rem;color:#111;font-weight:600}
 </style>
 </head>
-<body><main><h1>${escHtml(heading)}</h1><p>${escHtml(userMessage)}</p><p><code>${escHtml(errorCode)}</code></p>
+<body><main><h1>${escHtml(heading)}</h1><p>${escHtml(userMessage)}</p>${contextRows}
+<p><code>request ${escHtml(requestId)}</code></p>
+<p>Support: <a href="${escHtml(supportUrl)}">${escHtml(supportUrl)}</a></p>
+${restartHref === null ? "" : `<a href="${escHtml(restartHref)}">Restart sign-in</a><br>`}
 <a href="https://web.alcore.io.vn/login">Return to login</a>
 </main></body>
 </html>`,
@@ -280,21 +314,21 @@ oidcRoutes.get("/exchange/redirect", async (c) => {
   const redirectUri = c.req.query("redirect_uri") ?? "";
   const state = c.req.query("state") ?? "";
   if (audience !== "tokenpanel" && audience !== "libre") {
-    return exchangeRedirectError(c, 400, "invalid_audience", "Invalid app request.", "invalid_audience");
+    return exchangeRedirectError(c, 400, "invalid_audience", "Invalid app request.", "invalid_audience", { audience, redirectUri, state });
   }
   // State is the browser's CSRF binding, echoed back unchanged. Refusing an empty
   // one stops a caller from silently degrading its own CSRF protection.
   if (state === "" || state.length > 512) {
-    return exchangeRedirectError(c, 400, "invalid_state", "Invalid sign-in request. Please restart sign-in.", "invalid_state");
+    return exchangeRedirectError(c, 400, "invalid_state", "Invalid sign-in request. Please restart sign-in.", "invalid_state", { audience, redirectUri, state });
   }
   const origin = redirectOrigin(redirectUri);
   const registered = [...getOidcClients().values()].includes(redirectUri);
   if (redirectUri === "" || !registered || origin === null || !getAllowedOrigins().includes(origin)) {
-    return exchangeRedirectError(c, 400, "invalid_redirect_uri", "This app is not registered. Contact support.", "invalid_redirect_uri");
+    return exchangeRedirectError(c, 400, "invalid_redirect_uri", "This app is not registered. Contact support.", "invalid_redirect_uri", { audience, redirectUri, state });
   }
   const session = await cookieSession(c);
   if (session === null) {
-    return exchangeRedirectError(c, 401, "unauthorized", "Sign-in required. Please return to login and sign in first.", "unauthorized");
+    return exchangeRedirectError(c, 401, "unauthorized", "Sign-in required. Please return to login and sign in first.", "unauthorized", { audience, redirectUri, state });
   }
   const code = await productExchangeStore.issueForRedirect(
     session.userId,

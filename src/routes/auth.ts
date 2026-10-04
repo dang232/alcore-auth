@@ -113,6 +113,94 @@ async function readPurposeBody(c: Context): Promise<{ token: string; newPassword
   return { token: str(body?.["token"]), newPassword: str(body?.["newPassword"]) };
 }
 
+function wantsHtml(c: Context): boolean {
+  return (c.req.header("accept") ?? "").includes("text/html");
+}
+
+// R8: browser recovery page for an expired/replayed Google `state`.
+// The JSON shape stays exactly { error: "invalid_google_state" } for API
+// callers; only top-level browser navigations (Accept: text/html) get this
+// page. TTL single-use semantics are untouched — googleStateStore.consume is
+// still the single-use gate below; this page only offers the restart path.
+//
+// Sign-in panel auto-restart hook contract (stable): the page carries
+// `data-auth-error="invalid_google_state"` on <body> and the restart link
+// has id="auth-restart" pointing at /auth/google/start. A panel that embeds
+// or observes this navigation auto-restarts by following #auth-restart when
+// [data-auth-error="invalid_google_state"] is present. Restarting through
+// /auth/google/start mints a FRESH state+nonce (300s TTL, single-use), so
+// the old state is never revived.
+function googleStateErrorPage(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign-in expired</title>
+<style>
+body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:2rem 1rem;background:#f6f7f9;color:#111}
+main{max-width:26rem;margin:0 auto;background:#fff;padding:1.5rem;border:1px solid #e3e5e8;border-radius:.5rem}
+h1{font-size:1.25rem;margin:0 0 .5rem}
+p{margin:0 0 1rem;color:#444}
+code{font-size:.875rem;color:#666}
+a{display:inline-block;margin-top:.5rem;color:#111;font-weight:600}
+</style>
+</head>
+<body data-auth-error="invalid_google_state"><main><h1>Sign-in expired</h1><p>This Google sign-in request expired or was already used. Please start again — your account is unchanged.</p><p><code>invalid_google_state</code></p>
+<a id="auth-restart" href="/auth/google/start">Restart sign-in with Google</a><br>
+<a href="https://web.alcore.io.vn/login">Return to login</a>
+</main></body>
+</html>`;
+}
+
+// R35: browser recovery page for an expired/replayed verify/reset token.
+// JSON callers keep the exact { error: "invalid_token" } shape; browsers
+// get an interstitial whose resend form posts to the matching always-200
+// request endpoint, which mints a FRESH token. The old link is never
+// revived (consumePurposeOnce stays single-use; resend == new token).
+function invalidTokenResendPage(kind: "verify" | "reset"): string {
+  const action = kind === "verify" ? "/auth/verify/request" : "/auth/reset/request";
+  const heading = kind === "verify" ? "Verification link expired" : "Reset link expired";
+  const message = kind === "verify"
+    ? "This verification link expired or was already used. Enter your email to get a fresh one."
+    : "This password-reset link expired or was already used. Enter your email to get a fresh one.";
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${heading}</title>
+<style>
+body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:2rem 1rem;background:#f6f7f9;color:#111}
+main{max-width:26rem;margin:0 auto;background:#fff;padding:1.5rem;border:1px solid #e3e5e8;border-radius:.5rem}
+h1{font-size:1.25rem;margin:0 0 .5rem}
+p{margin:0 0 1rem;color:#444}
+code{font-size:.875rem;color:#666}
+label{display:block;margin:.75rem 0 .25rem;font-weight:600;font-size:.875rem}
+input{width:100%;padding:.6rem .7rem;font-size:1rem;border:1px solid #c9cdd2;border-radius:.375rem;box-sizing:border-box}
+button{margin-top:1rem;width:100%;padding:.65rem;font-size:1rem;font-weight:600;color:#fff;background:#111;border:0;border-radius:.375rem;cursor:pointer}
+button:hover{background:#333}
+</style>
+</head>
+<body data-auth-error="invalid_token"><main><h1>${heading}</h1><p>${message}</p><p><code>invalid_token</code></p>
+<form method="post" action="${action}"><label for="email">Email</label><input id="email" name="email" type="email" autocomplete="email" required><button type="submit" id="auth-resend">Resend link</button></form>
+</main></body>
+</html>`;
+}
+
+// The resend forms above post application/x-www-form-urlencoded while API
+// clients post JSON. Both reach the same always-200 handler; the response
+// never reveals whether the address exists (fail-closed, non-enumerating).
+async function readRequestEmail(c: Context): Promise<string> {
+  const type = c.req.header("content-type") ?? "";
+  if (type.includes("application/x-www-form-urlencoded") || type.includes("multipart/form-data")) {
+    const form = await c.req.parseBody();
+    return str(form["email"]).trim().toLowerCase();
+  }
+  const body = await readJson(c);
+  return str(body?.["email"]).trim().toLowerCase();
+}
+
 function bearer(c: Context): string {
   const h = c.req.header("authorization") ?? "";
   const m = /^Bearer (.+)$/.exec(h.trim());
@@ -445,8 +533,7 @@ authRoutes.post("/change", async (c) => {
 // POST /auth/verify/request — always 200 (no enumeration).
 authRoutes.post("/verify/request", async (c) => {
   const gateVerify = await limitedAsync(c, "verify"); if (gateVerify !== null) return gateVerify;
-  const body = await readJson(c);
-  const email = str(body?.["email"]).trim().toLowerCase();
+  const email = await readRequestEmail(c);
   const user = EMAIL_RE.test(email) ? await userStore.findByEmail(email) : undefined;
   if (user !== undefined) {
     // Deliver the minted token; the HTTP surface never reveals existence.
@@ -484,6 +571,7 @@ authRoutes.post("/verify/consume", async (c) => {
   const hit = await consumePurposeOnce(getJwtSecret(), "verify", token);
   if (hit === null) {
     emitAudit("auth.verify_consume", "invalid_token", { ip: clientIp(c) });
+    if (wantsHtml(c)) return c.html(invalidTokenResendPage("verify"), 400);
     return c.json({ error: "invalid_token" }, 400);
   }
   const user = await userStore.findById(hit.userId);
@@ -499,8 +587,7 @@ authRoutes.post("/verify/consume", async (c) => {
 // POST /auth/reset/request — always 200 (no enumeration).
 authRoutes.post("/reset/request", async (c) => {
   const gateReset = await limitedAsync(c, "reset"); if (gateReset !== null) return gateReset;
-  const body = await readJson(c);
-  const email = str(body?.["email"]).trim().toLowerCase();
+  const email = await readRequestEmail(c);
   const user = EMAIL_RE.test(email) ? await userStore.findByEmail(email) : undefined;
   if (user !== undefined) {
     void deliverPurposeMail(
@@ -541,6 +628,7 @@ authRoutes.post("/reset/consume", async (c) => {
   const hit = await consumePurposeOnce(getJwtSecret(), "reset", token);
   if (hit === null) {
     emitAudit("auth.reset_consume", "invalid_token", { ip: clientIp(c) });
+    if (wantsHtml(c)) return c.html(invalidTokenResendPage("reset"), 400);
     return c.json({ error: "invalid_token" }, 400);
   }
   const user = await userStore.findById(hit.userId);
@@ -624,15 +712,16 @@ function validateGoogleReturnHandoff(
   audience: string,
   redirectUri: string,
   state: string,
-): { audience: string; redirectUri: string; state: string } | { error: string } {
-  if (audience !== "libre" && audience !== "tokenpanel") return { error: "invalid_audience" };
+): { audience: "libre" | "tokenpanel"; redirectUri: string; state: string } | { error: string } {
+  const aud = audience === "libre" || audience === "tokenpanel" ? audience : null;
+  if (aud === null) return { error: "invalid_audience" };
   if (state === "" || state.length > 512) return { error: "invalid_state" };
   const origin = googleReturnOrigin(redirectUri);
   const registered = [...getOidcClients().values()].includes(redirectUri);
   if (redirectUri === "" || !registered || origin === null || !getAllowedOrigins().includes(origin)) {
     return { error: "invalid_redirect_uri" };
   }
-  return { audience, redirectUri, state };
+  return { audience: aud, redirectUri, state };
 }
 
 authRoutes.get("/google/start", async (c) => {
@@ -686,12 +775,14 @@ authRoutes.get("/google/callback", async (c) => {
   if (state === "" || code === "" || state !== expectedState) {
     deleteCookie(c, "alcore_google_state", { path: "/auth/google/callback" });
     emitAudit("auth.oauth_callback", "invalid_google_state", { ip: clientIp(c) });
+    if (wantsHtml(c)) return c.html(googleStateErrorPage(), 400);
     return c.json({ error: "invalid_google_state" }, 400);
   }
   const transaction = await googleStateStore.consume(state);
   deleteCookie(c, "alcore_google_state", { path: "/auth/google/callback" });
   if (transaction === null) {
     emitAudit("auth.oauth_callback", "invalid_google_state", { ip: clientIp(c) });
+    if (wantsHtml(c)) return c.html(googleStateErrorPage(), 400);
     return c.json({ error: "invalid_google_state" }, 400);
   }
   const clientId = getGoogleClientId();

@@ -189,6 +189,18 @@ export function getAllowedOrigins(): string[] {
     .filter((s) => s !== "");
 }
 
+const DEFAULT_SUPPORT_URL = "https://alcore.io.vn/support";
+
+/**
+ * Public support URL echoed on browser error pages as ticket context (R34).
+ * Display-only: nothing here edits the redirect allowlist, which stays
+ * operator-manual via AUTH_OIDC_CLIENTS / AUTH_ALLOWED_ORIGINS.
+ */
+export function getSupportUrl(): string {
+  const raw = (process.env["AUTH_SUPPORT_URL"] ?? "").trim();
+  return raw === "" ? DEFAULT_SUPPORT_URL : raw;
+}
+
 const DEFAULT_OIDC_CLIENTS: ReadonlyMap<string, string> = new Map([
   ["tokenpanel", "https://alcore.io.vn/portal/auth/callback"],
 ]);
