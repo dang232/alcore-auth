@@ -200,6 +200,35 @@ function googleFailCopy(errorCode: string): { heading: string; message: string }
   }
 }
 
+// Browser success page for a Google callback that carries no product return
+// handoff (no return cookie). API callers keep the exact token JSON below;
+// top-level browser navigations (Accept: text/html) get this friendly card in
+// the same visual style as the fail pages. ZERO token/user values appear in
+// the body -- the session travels only in the HttpOnly auth cookies already
+// set by setAuthCookies. Links point at the product surfaces; the restart
+// hook is intentionally absent (there is nothing to retry on success).
+function googleSignedInPage(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Signed in</title>
+<style>
+body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:2rem 1rem;background:#f6f7f9;color:#111}
+main{max-width:26rem;margin:0 auto;background:#fff;padding:1.5rem;border:1px solid #e3e5e8;border-radius:.5rem}
+h1{font-size:1.25rem;margin:0 0 .5rem}
+p{margin:0 0 1rem;color:#444}
+a{display:inline-block;margin-top:.5rem;color:#111;font-weight:600}
+</style>
+</head>
+<body><main><h1>Signed in with Google</h1><p>You are signed in. You can return to the app — your session is saved in this browser.</p>
+<a href="https://web.alcore.io.vn">Open the Alcore web app</a><br>
+<a href="https://alcore.io.vn">Alcore homepage</a>
+</main></body>
+</html>`;
+}
+
 // Single gate for every Google start/callback fail path below (except the two
 // invalid_google_state sites that already have the R8 page): HTML navigations
 // get the friendly card with the same status, API callers get the exact
@@ -753,6 +782,13 @@ const GOOGLE_RETURN_INTENT = "product_exchange";
 const GOOGLE_RETURN_CODE_TTL_SECONDS = 60;
 const GOOGLE_RETURN_COOKIE = "alcore_google_return";
 const GOOGLE_RETURN_COOKIE_PATH = "/auth/google/callback";
+// Restart-resume cookie: the bare restart link on every fail page carries
+// zero params, so a product handoff would be lost on restart. /start
+// persists the handoff triple here (short-lived, HttpOnly) and a bare
+// restart re-validates it (never trusted) before re-entering the handoff
+// branch. Path-scoped to /start: the callback keeps using the return cookie.
+const GOOGLE_RESUME_COOKIE = "alcore_google_resume";
+const GOOGLE_RESUME_COOKIE_PATH = "/auth/google/start";
 
 function googleReturnOrigin(url: string): string | null {
   try {
@@ -809,12 +845,53 @@ authRoutes.get("/google/start", async (c) => {
   if (handoffAudience !== "" || handoffRedirectUri !== "" || handoffState !== "") {
     const handoff = validateGoogleReturnHandoff(handoffAudience, handoffRedirectUri, handoffState);
     if ("error" in handoff) {
+      // Persist the attempted triple so a bare restart can resume it if it
+      // ever validates (e.g. operator allowlist updated since); a restart
+      // that still fails validation ignores it and keeps bare behavior.
+      setCookie(c, GOOGLE_RESUME_COOKIE, JSON.stringify({ audience: handoffAudience, redirect_uri: handoffRedirectUri, state: handoffState }), {
+        httpOnly: true, secure: true, sameSite: "Lax", path: GOOGLE_RESUME_COOKIE_PATH, maxAge: 300,
+      });
       emitAudit("auth.oauth_start", "invalid_request", { ip: clientIp(c) });
       return googleFail(c, 400, "invalid_request");
     }
-    setCookie(c, GOOGLE_RETURN_COOKIE, JSON.stringify({ audience: handoff.audience, redirect_uri: handoff.redirectUri, state: handoff.state }), {
+    const handoffBody = JSON.stringify({ audience: handoff.audience, redirect_uri: handoff.redirectUri, state: handoff.state });
+    setCookie(c, GOOGLE_RETURN_COOKIE, handoffBody, {
       httpOnly: true, secure: true, sameSite: "Lax", path: GOOGLE_RETURN_COOKIE_PATH, maxAge: 300,
     });
+    setCookie(c, GOOGLE_RESUME_COOKIE, handoffBody, {
+      httpOnly: true, secure: true, sameSite: "Lax", path: GOOGLE_RESUME_COOKIE_PATH, maxAge: 300,
+    });
+  } else {
+    // Bare restart link (zero params, as rendered on every fail page):
+    // resume a persisted product handoff so the product flow survives the
+    // restart. The cookie triple is re-validated here -- never trusted --
+    // and consumed single-shot; absent or invalid keeps today's bare
+    // behavior (fresh state, 302, no handoff).
+    const resumeRaw = getCookie(c, GOOGLE_RESUME_COOKIE) ?? "";
+    if (resumeRaw !== "") {
+      deleteCookie(c, GOOGLE_RESUME_COOKIE, { path: GOOGLE_RESUME_COOKIE_PATH });
+      let resume: { audience?: unknown; redirect_uri?: unknown; state?: unknown } | null = null;
+      try {
+        const parsed: unknown = JSON.parse(resumeRaw);
+        if (typeof parsed === "object" && parsed !== null) {
+          resume = parsed as { audience?: unknown; redirect_uri?: unknown; state?: unknown };
+        }
+      } catch {
+        resume = null;
+      }
+      if (resume !== null) {
+        const resumed = validateGoogleReturnHandoff(
+          String(resume.audience ?? ""),
+          String(resume.redirect_uri ?? ""),
+          String(resume.state ?? ""),
+        );
+        if (!("error" in resumed)) {
+          setCookie(c, GOOGLE_RETURN_COOKIE, JSON.stringify({ audience: resumed.audience, redirect_uri: resumed.redirectUri, state: resumed.state }), {
+            httpOnly: true, secure: true, sameSite: "Lax", path: GOOGLE_RETURN_COOKIE_PATH, maxAge: 300,
+          });
+        }
+      }
+    }
   }
   emitAudit("auth.oauth_start", "ok", { ip: clientIp(c) });
   return c.redirect(url.toString(), 302);
@@ -953,5 +1030,6 @@ authRoutes.get("/google/callback", async (c) => {
     }
   }
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
+  if (wantsHtml(c)) return c.html(googleSignedInPage(), 200);
   return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true } });
 });

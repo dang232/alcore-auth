@@ -201,7 +201,16 @@ export function getSupportUrl(): string {
   return raw === "" ? DEFAULT_SUPPORT_URL : raw;
 }
 
+// Committed code defaults for the Google → product return handoff (checked by
+// validateGoogleReturnHandoff in src/routes/auth.ts: the redirect_uri must be
+// one of these exact strings AND its origin in AUTH_ALLOWED_ORIGINS).
+// NOTE: an explicit AUTH_OIDC_CLIENTS env value replaces (not merges) these
+// defaults — see getOidcClients() below. Prod deploys register the Libre
+// return via AUTH_OIDC_CLIENTS; the portal entry stays here so self-hosted
+// and default deploys keep working without extra env.
 const DEFAULT_OIDC_CLIENTS: ReadonlyMap<string, string> = new Map([
+  ["libre", "https://web.alcore.io.vn/auth/alcore/callback"],
+  ["libre-local", "http://localhost:3000/auth/alcore/callback"],
   ["tokenpanel", "https://alcore.io.vn/portal/auth/callback"],
 ]);
 
