@@ -153,6 +153,63 @@ a{display:inline-block;margin-top:.5rem;color:#111;font-weight:600}
 </html>`;
 }
 
+// UX headline fix: every Google-OAuth fail path renders the same friendly
+// card for browser navigations (Accept: text/html) while API callers keep
+// byte-identical JSON. Same visual pattern as googleStateErrorPage and
+// exchangeRedirectError: centered card, machine code, restart + login links.
+// data-auth-error carries the machine code for the sign-in panel hook.
+function googleFailPage(errorCode: string, heading: string, message: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(heading)}</title>
+<style>
+body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:2rem 1rem;background:#f6f7f9;color:#111}
+main{max-width:26rem;margin:0 auto;background:#fff;padding:1.5rem;border:1px solid #e3e5e8;border-radius:.5rem}
+h1{font-size:1.25rem;margin:0 0 .5rem}
+p{margin:0 0 1rem;color:#444}
+code{font-size:.875rem;color:#666}
+a{display:inline-block;margin-top:.5rem;color:#111;font-weight:600}
+</style>
+</head>
+<body data-auth-error="${esc(errorCode)}"><main><h1>${esc(heading)}</h1><p>${esc(message)}</p><p><code>${esc(errorCode)}</code></p>
+<a id="auth-restart" href="/auth/google/start">Restart sign-in with Google</a><br>
+<a href="https://web.alcore.io.vn/login">Return to login</a>
+</main></body>
+</html>`;
+}
+
+function googleFailCopy(errorCode: string): { heading: string; message: string } {
+  switch (errorCode) {
+    case "google_not_configured":
+      return { heading: "Sign-in unavailable", message: "Google sign-in is not available right now. Please try again later or use another sign-in method." };
+    case "invalid_request":
+      return { heading: "Sign-in request invalid", message: "This Google sign-in request was invalid. Please start again \u2014 your account is unchanged." };
+    case "google_oauth_error":
+      return { heading: "Google sign-in cancelled", message: "Google did not approve this sign-in request (for example, access was denied). Please start again \u2014 your account is unchanged." };
+    case "upstream_unavailable":
+      return { heading: "Sign-in unavailable", message: "Google verification is temporarily unavailable. Please try again in a moment \u2014 your account is unchanged." };
+    case "invalid_google_credential":
+      return { heading: "Sign-in failed", message: "Google did not return a valid credential for this request. Please start again \u2014 your account is unchanged." };
+    case "identity_conflict":
+      return { heading: "Sign-in conflict", message: "This Google account is already linked to a different sign-in. Please use the original method or contact support." };
+    default:
+      return { heading: "Sign-in failed", message: "This Google sign-in request could not be completed. Please start again." };
+  }
+}
+
+// Single gate for every Google start/callback fail path below (except the two
+// invalid_google_state sites that already have the R8 page): HTML navigations
+// get the friendly card with the same status, API callers get the exact
+// { error } JSON shape as today (JSON.stringify of the same single key).
+function googleFail(c: Context, status: 400 | 401 | 409 | 503, errorCode: string): Response {
+  if (!wantsHtml(c)) return c.json({ error: errorCode }, status);
+  const copy = googleFailCopy(errorCode);
+  return c.html(googleFailPage(errorCode, copy.heading, copy.message), status);
+}
+
 // R35: browser recovery page for an expired/replayed verify/reset token.
 // JSON callers keep the exact { error: "invalid_token" } shape; browsers
 // get an interstitial whose resend form posts to the matching always-200
@@ -728,7 +785,7 @@ authRoutes.get("/google/start", async (c) => {
   const clientId = getGoogleClientId();
   if (clientId === "") {
     emitAudit("auth.oauth_start", "google_not_configured", { ip: clientIp(c) });
-    return c.json({ error: "google_not_configured" }, 503);
+    return googleFail(c, 503, "google_not_configured");
   }
   const state = randomToken(24);
   const nonce = randomToken(24);
@@ -753,7 +810,7 @@ authRoutes.get("/google/start", async (c) => {
     const handoff = validateGoogleReturnHandoff(handoffAudience, handoffRedirectUri, handoffState);
     if ("error" in handoff) {
       emitAudit("auth.oauth_start", "invalid_request", { ip: clientIp(c) });
-      return c.json({ error: "invalid_request" }, 400);
+      return googleFail(c, 400, "invalid_request");
     }
     setCookie(c, GOOGLE_RETURN_COOKIE, JSON.stringify({ audience: handoff.audience, redirect_uri: handoff.redirectUri, state: handoff.state }), {
       httpOnly: true, secure: true, sameSite: "Lax", path: GOOGLE_RETURN_COOKIE_PATH, maxAge: 300,
@@ -767,7 +824,7 @@ authRoutes.get("/google/callback", async (c) => {
   const gateGoogle = await limitedAsync(c, "google"); if (gateGoogle !== null) return gateGoogle;
   if (c.req.query("error") !== undefined) {
     emitAudit("auth.oauth_callback", "google_oauth_error", { ip: clientIp(c) });
-    return c.json({ error: "google_oauth_error" }, 400);
+    return googleFail(c, 400, "google_oauth_error");
   }
   const state = c.req.query("state") ?? "";
   const code = c.req.query("code") ?? "";
@@ -789,7 +846,7 @@ authRoutes.get("/google/callback", async (c) => {
   const clientSecret = (process.env["GOOGLE_CLIENT_SECRET"] ?? "").trim();
   if (clientId === "" || clientSecret === "") {
     emitAudit("auth.oauth_callback", "google_not_configured", { ip: clientIp(c) });
-    return c.json({ error: "google_not_configured" }, 503);
+    return googleFail(c, 503, "google_not_configured");
   }
   let tokenResponse: Response;
   try {
@@ -807,22 +864,22 @@ authRoutes.get("/google/callback", async (c) => {
     });
   } catch {
     emitAudit("auth.oauth_callback", "upstream_unavailable", { ip: clientIp(c) });
-    return c.json({ error: "upstream_unavailable" }, 503);
+    return googleFail(c, 503, "upstream_unavailable");
   }
   if (!tokenResponse.ok) {
     emitAudit("auth.oauth_callback", "invalid_google_credential", { ip: clientIp(c) });
-    return c.json({ error: "invalid_google_credential" }, 401);
+    return googleFail(c, 401, "invalid_google_credential");
   }
   let tokenBody: unknown;
   try {
     tokenBody = await tokenResponse.json();
   } catch {
     emitAudit("auth.oauth_callback", "upstream_unavailable", { ip: clientIp(c) });
-    return c.json({ error: "upstream_unavailable" }, 503);
+    return googleFail(c, 503, "upstream_unavailable");
   }
   if (typeof tokenBody !== "object" || tokenBody === null || typeof (tokenBody as Record<string, unknown>)["id_token"] !== "string") {
     emitAudit("auth.oauth_callback", "invalid_google_credential", { ip: clientIp(c) });
-    return c.json({ error: "invalid_google_credential" }, 401);
+    return googleFail(c, 401, "invalid_google_credential");
   }
   let profile;
   try {
@@ -833,11 +890,11 @@ authRoutes.get("/google/callback", async (c) => {
   } catch (error) {
     if (error instanceof GoogleCredentialError) {
       emitAudit("auth.oauth_callback", "invalid_google_credential", { ip: clientIp(c) });
-      return c.json({ error: "invalid_google_credential" }, 401);
+      return googleFail(c, 401, "invalid_google_credential");
     }
     if (error instanceof GoogleUpstreamError) {
       emitAudit("auth.oauth_callback", "upstream_unavailable", { ip: clientIp(c) });
-      return c.json({ error: "upstream_unavailable" }, 503);
+      return googleFail(c, 503, "upstream_unavailable");
     }
     throw error;
   }
@@ -845,14 +902,14 @@ authRoutes.get("/google/callback", async (c) => {
   const emailUser = await userStore.findByEmail(profile.email);
   if (existing !== undefined && emailUser !== undefined && existing.id !== emailUser.id) {
     emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
-    return c.json({ error: "identity_conflict" }, 409);
+    return googleFail(c, 409, "identity_conflict");
   }
   const user = existing ?? emailUser ?? (await userStore.create(profile.email, null));
   await userStore.setVerified(user.id);
   const linkResult = await userStore.linkIdentity(user.id, "google", profile.subject);
   if (linkResult === "owned_by_other_user") {
     emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
-    return c.json({ error: "identity_conflict" }, 409);
+    return googleFail(c, 409, "identity_conflict");
   }
   const { pair, session } = await issuePair(user.id);
   setAuthCookies(c, pair);
@@ -892,7 +949,7 @@ authRoutes.get("/google/callback", async (c) => {
         );
       }
       emitAudit("auth.oauth_callback", "invalid_request", { userId: user.id, ip: clientIp(c) });
-      return c.json({ error: "invalid_request" }, 400);
+      return googleFail(c, 400, "invalid_request");
     }
   }
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
