@@ -99,7 +99,7 @@ async function authed(path: string, token: string, init?: RequestInit): Promise<
 async function registerLogin(email: string, password: string): Promise<{ id: string; access_token: string; refresh_token: string }> {
   const reg = await post("/auth/register", { email, password });
   expect(reg.status).toBe(202);
-  expect(await reg.json()).toEqual({ pending: true, email });
+  expect(await reg.json()).toEqual({ pending: true, otpRequired: true, email });
   const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
   expect(code).toMatch(/^\d{6}$/);
   const verify = await post("/auth/verify-otp", { email, code });
@@ -122,7 +122,7 @@ describe("registration lifecycle", () => {
   test("register → 202 pending, verify-otp mints the session pair + auth.register ok", async () => {
     const res = await post("/auth/register", { email: "lh-reg1@example.com", password: "s3cret-pass" });
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ pending: true, email: "lh-reg1@example.com" });
+    expect(await res.json()).toEqual({ pending: true, otpRequired: true, email: "lh-reg1@example.com" });
     expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_at="))).toBe(false);
     expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_rt="))).toBe(false);
     expect((await userStore.findByEmail("lh-reg1@example.com"))?.emailVerified).toBe(false);
@@ -146,7 +146,7 @@ describe("registration lifecycle", () => {
     expect((await post("/auth/register", { email: "lh-reg2@example.com", password: "short" })).status).toBe(400);
     const pending = await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" });
     expect(pending.status).toBe(202);
-    expect(await pending.json()).toEqual({ pending: true, email: "lh-reg2@example.com" });
+    expect(await pending.json()).toEqual({ pending: true, otpRequired: true, email: "lh-reg2@example.com" });
     const taken = await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" });
     expect(taken.status).toBe(409);
     expect(await taken.json()).toEqual({ error: "email_taken" });

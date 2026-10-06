@@ -49,7 +49,7 @@ async function del(path: string, ip: string, bearer?: string): Promise<Response>
 async function register(ip: string, email: string): Promise<{ id: string; access: string; refresh: string }> {
   const res = await post("/auth/register", { email, password: "s3cret-pass" }, ip);
   expect(res.status).toBe(202);
-  expect(await res.json()).toEqual({ pending: true, email });
+  expect(await res.json()).toEqual({ pending: true, otpRequired: true, email });
   const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
   expect(code).toMatch(/^\d{6}$/);
   const verify = await post("/auth/verify-otp", { email, code }, ip);

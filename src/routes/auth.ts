@@ -384,7 +384,8 @@ authRoutes.post("/register", async (c) => {
     // Cooldown window: keep the pending answer; the earlier code stays valid.
   }
   emitAudit("auth.register", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ pending: true, email: user.email }, 202);
+  // otpRequired mirrors pending for the Libre signup screen contract.
+  return c.json({ pending: true, otpRequired: true, email: user.email }, 202);
 });
 
 // POST /auth/login — identical 401 shape for unknown email vs bad password.

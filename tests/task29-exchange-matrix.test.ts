@@ -286,7 +286,7 @@ describe("task 29 — exchange idempotency + race + failure matrix", () => {
       body: JSON.stringify({ email, password: "s3cret-pass-long" }),
     });
     expect(first.status).toBe(202);
-    expect(await first.json()).toEqual({ pending: true, email });
+    expect(await first.json()).toEqual({ pending: true, otpRequired: true, email });
 
     const verify = await post("/auth/verify-otp", { email, code: mailedCode(sent[0] as MailMessage) });
     expect(verify.status).toBe(200);
@@ -329,7 +329,7 @@ describe("task 29 — exchange idempotency + race + failure matrix", () => {
     // the pinned 1-identity outcome, never two rows.
     expect([202, 409].includes(statuses[0]!) && [202, 409].includes(statuses[1]!)).toBe(true);
     for (const r of results) {
-      if (r.status === 202) expect(await r.json()).toEqual({ pending: true, email });
+      if (r.status === 202) expect(await r.json()).toEqual({ pending: true, otpRequired: true, email });
       else expect(await r.json()).toEqual({ error: "email_taken" });
     }
 

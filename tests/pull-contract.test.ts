@@ -70,7 +70,7 @@ describe("pull contract: register mints identity-only proof", () => {
   test("202 pending then verify carries id + session pair and zero product/business fields", async () => {
     const res = await post("/auth/register", { email: "pull-reg@example.com", password: "s3cret-pass" });
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ pending: true, email: "pull-reg@example.com" });
+    expect(await res.json()).toEqual({ pending: true, otpRequired: true, email: "pull-reg@example.com" });
     const cookies = res.headers.getSetCookie();
     expect(cookies.some((v) => v.startsWith("alcore_at="))).toBe(false);
     expect(cookies.some((v) => v.startsWith("alcore_rt="))).toBe(false);

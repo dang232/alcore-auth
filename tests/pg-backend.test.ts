@@ -86,7 +86,7 @@ function mailedCode(message: MailMessage): string {
 async function registerVerifyLogin(email: string, password: string): Promise<{ access_token: string; refresh_token: string }> {
   const reg = await post("/auth/register", { email, password });
   expect(reg.status).toBe(202);
-  expect(await reg.json()).toEqual({ pending: true, email });
+  expect(await reg.json()).toEqual({ pending: true, otpRequired: true, email });
   const verify = await post("/auth/verify-otp", { email, code: mailedCode(sent[0] as MailMessage) });
   expect(verify.status).toBe(200);
   const login = await post("/auth/login", { email, password });

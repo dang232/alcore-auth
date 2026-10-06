@@ -56,7 +56,7 @@ describe("OTP gate", () => {
   test("register-pending: 202 {pending:true,email}, no session pair, user unverified", async () => {
     const res = await post("/auth/register", { email: "otp-pending@example.com", password: "s3cret-pass" });
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ pending: true, email: "otp-pending@example.com" });
+    expect(await res.json()).toEqual({ pending: true, otpRequired: true, email: "otp-pending@example.com" });
     const cookies = res.headers.getSetCookie();
     expect(cookies.some((v) => v.startsWith("alcore_at="))).toBe(false);
     expect(cookies.some((v) => v.startsWith("alcore_rt="))).toBe(false);

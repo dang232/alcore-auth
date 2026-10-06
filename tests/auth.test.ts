@@ -75,7 +75,7 @@ describe("register + login", () => {
   test("POST /auth/register creates an Auth user with a string id", async () => {
     const res = await post("/auth/register", { email: "alice@example.com", password: "s3cret-pass" });
     expect(res.status).toBe(202);
-    expect(await res.json()).toEqual({ pending: true, email: "alice@example.com" });
+    expect(await res.json()).toEqual({ pending: true, otpRequired: true, email: "alice@example.com" });
     expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_at="))).toBe(false);
     expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_rt="))).toBe(false);
     const code = mailedCode(sent.find((m) => m.to === "alice@example.com") as MailMessage);
