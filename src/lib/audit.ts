@@ -25,6 +25,8 @@ export type AuditEvent =
   | "auth.login_reset_required"
   | "auth.verify_request"
   | "auth.verify_consume"
+  | "auth.verify_otp"
+  | "auth.otp_resend"
   | "auth.reset_request"
   | "auth.reset_consume"
   | "auth.oauth_start"

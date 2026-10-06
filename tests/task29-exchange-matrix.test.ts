@@ -15,7 +15,7 @@
 //   3. failure modes (tampered state / swapped redirect / wrong audience /
 //      bound-via-legacy path) -> byte-identical rejects, zero new rows, and
 //      the code UNBURNED (correct redeem still 200 afterwards).
-//   4. double-POST /auth/register same email -> 201 then 409 email_taken,
+//   4. double-POST /auth/register same email -> 202 pending then 409 email_taken,
 //      exactly 1 identity row; concurrent double-POST -> still 1 row.
 //   5. enumeration sweep of bad codes -> uniform invalid_grant, no oracle.
 process.env["JWT_SECRET"] = "test-only-dummy-secret-0123456789abcdef";
@@ -43,10 +43,12 @@ function restoreEnv(): void {
   }
 }
 
-import { describe, test, expect, beforeEach, afterAll } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
 import { app } from "../src/index";
 import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { resetStoresForTests } from "../src/lib/store";
+import { resetSignupOtpsForTests } from "../src/lib/otp";
+import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
 
 const LIBRE_REDIRECT = "https://web.alcore.io.vn/auth/callback";
 const PANEL_REDIRECT = "https://portal.alcore.io.vn/auth/callback";
@@ -128,12 +130,40 @@ function goodBody(code: string, state: string): Record<string, unknown> {
   };
 }
 
+const sent: MailMessage[] = [];
+
+/** Pull the 6-digit code out of the mailed body (it travels as token=<code>). */
+function mailedCode(message: MailMessage): string {
+  const viaToken = /token=(\d{6})/.exec(message.text)?.[1];
+  if (viaToken !== undefined) return viaToken;
+  return /\d{6}/.exec(message.text)?.[0] ?? "";
+}
+
+async function post(path: string, body: unknown): Promise<Response> {
+  return app.request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 describe("task 29 — exchange idempotency + race + failure matrix", () => {
   beforeEach(async () => {
+    sent.length = 0;
+    resetMailSender();
+    setMailSender(async (message) => {
+      sent.push(message);
+      return "delivered";
+    });
+    resetSignupOtpsForTests();
     await resetStoresForTests();
     resetRateLimitsForTests();
     resetThrottleConnForTests();
     applyRedirectEnv();
+  });
+
+  afterEach(() => {
+    resetMailSender();
   });
 
   afterAll(() => {
@@ -245,7 +275,7 @@ describe("task 29 — exchange idempotency + race + failure matrix", () => {
     );
   });
 
-  test("double-POST register same email: 201 then 409 email_taken, exactly 1 identity", async () => {
+  test("double-POST register same email: 202 pending then 409 email_taken, exactly 1 identity", async () => {
     const { userStore } = await import("../src/lib/store");
     const email = "matrix-double-reg@example.com";
     const usersBefore = await userStore.count();
@@ -255,9 +285,12 @@ describe("task 29 — exchange idempotency + race + failure matrix", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ email, password: "s3cret-pass-long" }),
     });
-    expect(first.status).toBe(201);
-    const firstBody = (await first.json()) as { id: string; email: string };
-    expect(firstBody.email).toBe(email);
+    expect(first.status).toBe(202);
+    expect(await first.json()).toEqual({ pending: true, email });
+
+    const verify = await post("/auth/verify-otp", { email, code: mailedCode(sent[0] as MailMessage) });
+    expect(verify.status).toBe(200);
+    const firstId = ((await verify.json()) as { user: { id: string } }).user.id;
 
     const second = await app.request("/auth/register", {
       method: "POST",
@@ -270,9 +303,9 @@ describe("task 29 — exchange idempotency + race + failure matrix", () => {
     const usersAfter = await userStore.count();
     expect(usersAfter).toBe(usersBefore + 1);
     const identity = await userStore.findByEmail(email);
-    expect(identity?.id).toBe(firstBody.id);
+    expect(identity?.id).toBe(firstId);
     console.log(
-      `[matrix-register] first=201 second=409 users=${usersBefore}->${usersAfter} identity=${firstBody.id}`,
+      `[matrix-register] first=202 second=409 users=${usersBefore}->${usersAfter} identity=${firstId}`,
     );
   });
 
@@ -291,25 +324,21 @@ describe("task 29 — exchange idempotency + race + failure matrix", () => {
       ),
     );
     const statuses = results.map((r) => r.status).sort();
-    // Either strict serialization (201+409) or a lost-findByEmail race
-    // resolved by the UNIQUE backstop (201+201 for the SAME row): both are
+    // Either strict serialization (202+409) or a lost-findByEmail race
+    // resolved by the UNIQUE backstop (202+202 for the SAME row): both are
     // the pinned 1-identity outcome, never two rows.
-    expect([201, 409].includes(statuses[0]!) && [201, 409].includes(statuses[1]!)).toBe(true);
-    const ids = new Set<string>();
+    expect([202, 409].includes(statuses[0]!) && [202, 409].includes(statuses[1]!)).toBe(true);
     for (const r of results) {
-      if (r.status === 201) ids.add(((await r.json()) as { id: string }).id);
+      if (r.status === 202) expect(await r.json()).toEqual({ pending: true, email });
       else expect(await r.json()).toEqual({ error: "email_taken" });
     }
-    expect(ids.size).toBeLessThanOrEqual(1);
 
     const usersAfter = await userStore.count();
     expect(usersAfter).toBe(usersBefore + 1);
-    if (ids.size === 1) {
-      const identity = await userStore.findByEmail(email);
-      expect(identity?.id).toBe([...ids][0]);
-    }
+    const identity = await userStore.findByEmail(email);
+    expect(identity?.email).toBe(email);
     console.log(
-      `[matrix-register-race] statuses=${statuses.join(",")} users=${usersBefore}->${usersAfter} distinct-201-ids=${ids.size}`,
+      `[matrix-register-race] statuses=${statuses.join(",")} users=${usersBefore}->${usersAfter} identity=${identity?.id}`,
     );
   });
 

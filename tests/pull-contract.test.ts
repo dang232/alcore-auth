@@ -7,19 +7,34 @@ process.env["JWT_SECRET"] = "test-only-dummy-secret-0123456789abcdef";
 process.env["ALLOW_WEAK_JWT_SECRET"] = "1";
 process.env["NODE_ENV"] = "test";
 
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { app } from "../src/index";
 import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { resetStoresForTests, userStore, sessionStore, productExchangeStore } from "../src/lib/store";
+import { resetSignupOtpsForTests } from "../src/lib/otp";
+import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
 import { getIssuer, getJwtRotationKeys, getJwtSecret } from "../src/config";
 import { hashToken, randomToken, signAccess, verifyAccess } from "../src/lib/crypto";
 import { buildProvisionKey } from "../src/lib/provision-hook";
 
 await resetStoresForTests();
 
+const sent: MailMessage[] = [];
+
 beforeEach(() => {
+  sent.length = 0;
+  resetMailSender();
+  setMailSender(async (message) => {
+    sent.push(message);
+    return "delivered";
+  });
+  resetSignupOtpsForTests();
   resetRateLimitsForTests();
   resetThrottleConnForTests();
+});
+
+afterEach(() => {
+  resetMailSender();
 });
 
 async function post(path: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
@@ -28,6 +43,13 @@ async function post(path: string, body: unknown, headers: Record<string, string>
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
+}
+
+/** Pull the 6-digit code out of the mailed body (it travels as token=<code>). */
+function mailedCode(message: MailMessage): string {
+  const viaToken = /token=(\d{6})/.exec(message.text)?.[1];
+  if (viaToken !== undefined) return viaToken;
+  return /\d{6}/.exec(message.text)?.[0] ?? "";
 }
 
 /** Direct store session (zero HTTP): the shared rate bucket is suite-wide,
@@ -45,12 +67,23 @@ async function sessionFor(email: string): Promise<{ id: string; sessionId: strin
 }
 
 describe("pull contract: register mints identity-only proof", () => {
-  test("201 carries id + session pair and zero product/business fields", async () => {
+  test("202 pending then verify carries id + session pair and zero product/business fields", async () => {
     const res = await post("/auth/register", { email: "pull-reg@example.com", password: "s3cret-pass" });
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(typeof body["id"]).toBe("string");
-    expect(body["email"]).toBe("pull-reg@example.com");
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ pending: true, email: "pull-reg@example.com" });
+    const cookies = res.headers.getSetCookie();
+    expect(cookies.some((v) => v.startsWith("alcore_at="))).toBe(false);
+    expect(cookies.some((v) => v.startsWith("alcore_rt="))).toBe(false);
+    expect(sent).toHaveLength(1);
+    expect(mailedCode(sent[0] as MailMessage)).toMatch(/^\d{6}$/);
+    const verify = await post("/auth/verify-otp", {
+      email: "pull-reg@example.com",
+      code: mailedCode(sent[0] as MailMessage),
+    });
+    expect(verify.status).toBe(200);
+    const body = (await verify.json()) as Record<string, unknown>;
+    expect(typeof (body["user"] as Record<string, unknown>)["id"]).toBe("string");
+    expect((body["user"] as Record<string, unknown>)["email"]).toBe("pull-reg@example.com");
     expect(typeof body["access_token"]).toBe("string");
     for (const banned of ["customerId", "customer", "package", "balance", "entitlement", "subscription"]) {
       expect(body[banned]).toBeUndefined();
@@ -60,8 +93,9 @@ describe("pull contract: register mints identity-only proof", () => {
     });
     expect(me.status).toBe(200);
     const view = (await me.json()) as { id: string; email: string; emailVerified: boolean };
-    expect(view.id).toBe(String(body["id"]));
+    expect(view.id).toBe(String((body["user"] as Record<string, unknown>)["id"]));
     expect(view.email).toBe("pull-reg@example.com");
+    expect(view.emailVerified).toBe(true);
   });
 });
 

@@ -47,14 +47,32 @@ import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/r
 import { resetStoresForTests, userStore } from "../src/lib/store";
 import { clearAuditForTests, listAuditForTests } from "../src/lib/audit";
 import { resetGoogleJwksCacheForTests } from "../src/lib/google";
+import { resetSignupOtpsForTests } from "../src/lib/otp";
+import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
 import { baseGoogleClaims, createGoogleTestRig, TEST_GOOGLE_CLIENT_ID } from "./google-jwks-helper";
 
 await resetStoresForTests();
 clearAuditForTests();
 
+const sent: MailMessage[] = [];
+
+/** Pull the 6-digit code out of the mailed body (it travels as token=<code>). */
+function mailedCode(message: MailMessage): string {
+  const viaToken = /token=(\d{6})/.exec(message.text)?.[1];
+  if (viaToken !== undefined) return viaToken;
+  return /\d{6}/.exec(message.text)?.[0] ?? "";
+}
+
 beforeEach(async () => {
   await resetStoresForTests();
   clearAuditForTests();
+  sent.length = 0;
+  resetMailSender();
+  setMailSender(async (message) => {
+    sent.push(message);
+    return "delivered";
+  });
+  resetSignupOtpsForTests();
   resetRateLimitsForTests();
   resetThrottleConnForTests();
   resetGoogleJwksCacheForTests();
@@ -62,6 +80,7 @@ beforeEach(async () => {
 });
 
 afterAll(() => {
+  resetMailSender();
   restoreEnv();
 });
 
@@ -79,12 +98,16 @@ async function authed(path: string, token: string, init?: RequestInit): Promise<
 
 async function registerLogin(email: string, password: string): Promise<{ id: string; access_token: string; refresh_token: string }> {
   const reg = await post("/auth/register", { email, password });
-  expect(reg.status).toBe(201);
-  const login = await post("/auth/login", { email, password });
-  expect(login.status).toBe(200);
-  const body = (await login.json()) as { access_token: string; refresh_token: string };
+  expect(reg.status).toBe(202);
+  expect(await reg.json()).toEqual({ pending: true, email });
+  const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
+  expect(code).toMatch(/^\d{6}$/);
+  const verify = await post("/auth/verify-otp", { email, code });
+  expect(verify.status).toBe(200);
+  const body = (await verify.json()) as { access_token: string; refresh_token: string; user: { emailVerified: boolean } };
+  expect(body.user.emailVerified).toBe(true);
   const me = (await authed("/auth/me", body.access_token).then((r) => r.json())) as { id: string };
-  return { id: me.id, ...body };
+  return { id: me.id, access_token: body.access_token, refresh_token: body.refresh_token };
 }
 
 function auditEvents(): Array<{ event: string; outcome: string }> {
@@ -96,24 +119,34 @@ function saw(event: string, outcome: string): boolean {
 }
 
 describe("registration lifecycle", () => {
-  test("register → 201 with session pair + auth.register ok", async () => {
+  test("register → 202 pending, verify-otp mints the session pair + auth.register ok", async () => {
     const res = await post("/auth/register", { email: "lh-reg1@example.com", password: "s3cret-pass" });
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(typeof body["id"]).toBe("string");
-    expect(body["email"]).toBe("lh-reg1@example.com");
-    expect(body["emailVerified"]).toBe(false);
-    expect(body["token_type"]).toBe("Bearer");
-    expect(body["expires_in"]).toBe(900);
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ pending: true, email: "lh-reg1@example.com" });
+    expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_at="))).toBe(false);
+    expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_rt="))).toBe(false);
+    expect((await userStore.findByEmail("lh-reg1@example.com"))?.emailVerified).toBe(false);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.to).toBe("lh-reg1@example.com");
+    const code = mailedCode(sent[0] as MailMessage);
+    expect(code).toMatch(/^\d{6}$/);
+    const verify = await post("/auth/verify-otp", { email: "lh-reg1@example.com", code });
+    expect(verify.status).toBe(200);
+    const body = (await verify.json()) as Record<string, unknown>;
     expect(typeof body["access_token"]).toBe("string");
     expect(typeof body["refresh_token"]).toBe("string");
+    expect(body["token_type"]).toBe("Bearer");
+    expect(body["expires_in"]).toBe(900);
+    expect((body["user"] as { emailVerified: boolean }).emailVerified).toBe(true);
     expect(saw("auth.register", "ok")).toBe(true);
   });
 
   test("register rejects bad email / weak password / taken email with audit", async () => {
     expect((await post("/auth/register", { email: "not-an-email", password: "s3cret-pass" })).status).toBe(400);
     expect((await post("/auth/register", { email: "lh-reg2@example.com", password: "short" })).status).toBe(400);
-    expect((await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" })).status).toBe(201);
+    const pending = await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" });
+    expect(pending.status).toBe(202);
+    expect(await pending.json()).toEqual({ pending: true, email: "lh-reg2@example.com" });
     const taken = await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" });
     expect(taken.status).toBe(409);
     expect(await taken.json()).toEqual({ error: "email_taken" });
@@ -127,7 +160,12 @@ describe("registration lifecycle", () => {
 
 describe("login + exact cookie flags + generic errors", () => {
   test("login mints exact cookie flags and identical 401s leak nothing", async () => {
-    await post("/auth/register", { email: "lh-login1@example.com", password: "s3cret-pass" });
+    const pendingLogin = await post("/auth/register", { email: "lh-login1@example.com", password: "s3cret-pass" });
+    expect(pendingLogin.status).toBe(202);
+    const loginCode = mailedCode(sent.find((m) => m.to === "lh-login1@example.com") as MailMessage);
+    expect(loginCode).toMatch(/^\d{6}$/);
+    const verified = await post("/auth/verify-otp", { email: "lh-login1@example.com", code: loginCode });
+    expect(verified.status).toBe(200);
     const res = await post("/auth/login", { email: "lh-login1@example.com", password: "s3cret-pass" });
     expect(res.status).toBe(200);
     const cookies = res.headers.getSetCookie();
@@ -224,7 +262,11 @@ describe("verification one-use + non-enumeration", () => {
 
 describe("reset one-use + session revoke + non-enumeration", () => {
   test("request identical bodies; consume rotates + revokes all; replay 400", async () => {
-    await post("/auth/register", { email: "lh-r1@example.com", password: "old-pass-123" });
+    const pendingR1 = await post("/auth/register", { email: "lh-r1@example.com", password: "old-pass-123" });
+    expect(pendingR1.status).toBe(202);
+    const r1Code = mailedCode(sent.find((m) => m.to === "lh-r1@example.com") as MailMessage);
+    expect(r1Code).toMatch(/^\d{6}$/);
+    expect((await post("/auth/verify-otp", { email: "lh-r1@example.com", code: r1Code })).status).toBe(200);
     const a = await post("/auth/reset/request", { email: "lh-r1@example.com" });
     const b = await post("/auth/reset/request", { email: "lh-ghost2@example.com" });
     expect(a.status).toBe(200);
@@ -285,8 +327,9 @@ describe("session listing + revocation", () => {
     const listed = (await (await authed("/auth/sessions", first.access_token)).json()) as {
       sessions: Array<{ id: string; current: boolean }>;
     };
-    // register mints 1 session + each login mints 1 → 3 live sessions here.
-    expect(listed.sessions).toHaveLength(3);
+    // verify mints 1 session + each login mints 1 → 2 live sessions here
+    // (register itself is 202 pending with no session).
+    expect(listed.sessions).toHaveLength(2);
     expect(listed.sessions.filter((s) => s.current)).toHaveLength(1);
     // Revoke the second login's own session: resolve its id from its own
     // listing (current=true there), delete via the first token.
@@ -559,6 +602,8 @@ describe("OAuth generic errors + conflict audit", () => {
 describe("audit trail integrity", () => {
   test("full lifecycle emits per-transition events with no secret material", async () => {
     const s = await registerLogin("lh-audit1@example.com", "s3cret-pass");
+    const auditLogin = await post("/auth/login", { email: "lh-audit1@example.com", password: "s3cret-pass" });
+    expect(auditLogin.status).toBe(200);
     await post("/auth/refresh", { refresh_token: s.refresh_token });
     await post("/auth/logout", { refresh_token: s.refresh_token });
     const events = auditEvents().map((r) => r.event);

@@ -8,7 +8,7 @@ process.env["JWT_SECRET"] = "test-only-dummy-secret-0123456789abcdef";
 process.env["ALLOW_WEAK_JWT_SECRET"] = "1";
 process.env["NODE_ENV"] = "test";
 
-import { describe, test, expect, beforeEach, afterAll } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { app } from "../src/index";
@@ -17,6 +17,8 @@ import { mintPurposeToken, hashToken, pkceS256Challenge } from "../src/lib/crypt
 import { createPgStores, pgliteConn } from "../src/lib/pg-store";
 import { __setPgConnForTests, resetStoresForTests } from "../src/lib/store";
 import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
+import { resetSignupOtpsForTests } from "../src/lib/otp";
+import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
 import { parityReport, readTable, restoreFromFile, snapshotToFile, AUTH_TABLES, type AuthTable } from "../scripts/lib/pg-ops";
 import type { PgRow } from "../src/lib/pg-store";
 
@@ -46,10 +48,23 @@ afterAll(async () => {
   }
 });
 
+const sent: MailMessage[] = [];
+
 beforeEach(async () => {
+  sent.length = 0;
+  resetMailSender();
+  setMailSender(async (message) => {
+    sent.push(message);
+    return "delivered";
+  });
+  resetSignupOtpsForTests();
   await resetStoresForTests();
   resetRateLimitsForTests();
   resetThrottleConnForTests();
+});
+
+afterEach(() => {
+  resetMailSender();
 });
 
 async function post(path: string, body: unknown): Promise<Response> {
@@ -60,13 +75,28 @@ async function post(path: string, body: unknown): Promise<Response> {
   });
 }
 
+/** Pull the 6-digit code out of the mailed body (it travels as token=<code>). */
+function mailedCode(message: MailMessage): string {
+  const viaToken = /token=(\d{6})/.exec(message.text)?.[1];
+  if (viaToken !== undefined) return viaToken;
+  return /\d{6}/.exec(message.text)?.[0] ?? "";
+}
+
+/** Register a password user through the pending-verify flow and return a login pair. */
+async function registerVerifyLogin(email: string, password: string): Promise<{ access_token: string; refresh_token: string }> {
+  const reg = await post("/auth/register", { email, password });
+  expect(reg.status).toBe(202);
+  expect(await reg.json()).toEqual({ pending: true, email });
+  const verify = await post("/auth/verify-otp", { email, code: mailedCode(sent[0] as MailMessage) });
+  expect(verify.status).toBe(200);
+  const login = await post("/auth/login", { email, password });
+  expect(login.status).toBe(200);
+  return (await login.json()) as { access_token: string; refresh_token: string };
+}
+
 describe("F0 postgres: register/login/refresh/reuse/logout", () => {
   test("full session lifecycle behaves identically on Postgres", async () => {
-    const reg = await post("/auth/register", { email: "f0-alice@example.com", password: "s3cret-pass" });
-    expect(reg.status).toBe(201);
-    const login = await post("/auth/login", { email: "f0-alice@example.com", password: "s3cret-pass" });
-    expect(login.status).toBe(200);
-    const pair = (await login.json()) as { access_token: string; refresh_token: string };
+    const pair = await registerVerifyLogin("f0-alice@example.com", "s3cret-pass");
     const me = await app.request("/auth/me", { headers: { authorization: `Bearer ${pair.access_token}` } });
     expect(me.status).toBe(200);
     const r1 = await post("/auth/refresh", { refresh_token: pair.refresh_token });
@@ -81,9 +111,7 @@ describe("F0 postgres: register/login/refresh/reuse/logout", () => {
 
 describe("F0 postgres: verify/reset/change one-use flows", () => {
   test("verify consumes once, reset rotates + revokes, change mints fresh", async () => {
-    await post("/auth/register", { email: "f0-bob@example.com", password: "old-pass-123" });
-    const login = await post("/auth/login", { email: "f0-bob@example.com", password: "old-pass-123" });
-    const pair = (await login.json()) as { access_token: string; refresh_token: string };
+    const pair = await registerVerifyLogin("f0-bob@example.com", "old-pass-123");
     const me = (await (await app.request("/auth/me", { headers: { authorization: `Bearer ${pair.access_token}` } })).json()) as { id: string };
     const vtoken = mintPurposeToken(getJwtSecret(), "verify", me.id, 3600);
     expect((await post("/auth/verify/consume", { token: vtoken })).status).toBe(200);
@@ -105,9 +133,7 @@ describe("F0 postgres: sessions list+revoke, OAuth link, OIDC/PKCE, exchange", (
   test("identity + OIDC surfaces behave identically on Postgres", async () => {
     process.env["AUTH_OIDC_CLIENTS"] = "f0client=https://web.alcore.io.vn/cb";
     try {
-      await post("/auth/register", { email: "f0-carol@example.com", password: "s3cret-pass" });
-      const login = await post("/auth/login", { email: "f0-carol@example.com", password: "s3cret-pass" });
-      const pair = (await login.json()) as { access_token: string; refresh_token: string };
+      const pair = await registerVerifyLogin("f0-carol@example.com", "s3cret-pass");
       const listed = (await (await app.request("/auth/sessions", { headers: { authorization: `Bearer ${pair.access_token}` } })).json()) as {
         sessions: Array<{ id: string; current: boolean }>;
       };

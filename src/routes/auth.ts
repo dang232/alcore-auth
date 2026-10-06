@@ -27,6 +27,7 @@ import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential } fr
 import type { Session } from "../lib/store";
 import { limitedAsync as throttleGuard } from "../lib/ratelimit";
 import { deliverPurposeMail } from "../lib/mail";
+import { issueSignupOtp, sendSignupOtp, verifySignupOtp } from "../lib/otp";
 
 export const ACCESS_TTL_SECONDS = 900; // short-lived access (15 min)
 export const REFRESH_TTL_MS = 30 * 24 * 3600 * 1000; // rotating refresh (30 d)
@@ -368,10 +369,22 @@ authRoutes.post("/register", async (c) => {
     return c.json({ error: "email_taken" }, 409);
   }
   const user = await userStore.create(email, await hashPassword(password));
-  const { pair } = await issuePair(user.id);
-  setAuthCookies(c, pair);
+  // OTP gate: password signups start unverified (emailVerified:false from the
+  // store default). Issue a signup code and mail it, then answer 202 pending
+  // with NO session pair and NO auth cookies — the session is minted by
+  // POST /auth/verify-otp after the code verifies. Awaited (not
+  // fire-and-forget) so the code is in flight before the client can verify.
+  // sendSignupOtp never throws (fail-closed mail seam); only the cooldown
+  // throw from issueSignupOtp is swallowed — unreachable for a fresh user,
+  // which by construction holds no pending record.
+  try {
+    const code = await issueSignupOtp(user.id, user.email);
+    await sendSignupOtp(user.email, code);
+  } catch {
+    // Cooldown window: keep the pending answer; the earlier code stays valid.
+  }
   emitAudit("auth.register", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ id: user.id, email: user.email, emailVerified: user.emailVerified, ...pair }, 201);
+  return c.json({ pending: true, email: user.email }, 202);
 });
 
 // POST /auth/login — identical 401 shape for unknown email vs bad password.
@@ -403,6 +416,15 @@ authRoutes.post("/login", async (c) => {
   if (compat === "legacy-ok") {
     await userStore.setPasswordHash(user.id, await hashPassword(password));
     emitAudit("auth.password_rehash", "ok", { userId: user.id, ip: clientIp(c) });
+  }
+  // OTP gate: password users must verify their email (via POST
+  // /auth/verify-otp) before a session is minted. Checked AFTER password
+  // verification so a wrong password still answers the identical 401 above
+  // (no verification oracle). Google-created users have passwordHash null
+  // and already returned 401 above — untouched by this gate.
+  if (!user.emailVerified) {
+    emitAudit("auth.login", "email_not_verified", { userId: user.id, ip: clientIp(c) });
+    return c.json({ error: "email_not_verified" }, 403);
   }
   const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
@@ -725,6 +747,51 @@ authRoutes.post("/reset/consume", async (c) => {
   await userStore.setPasswordHash(hit.userId, await hashPassword(newPassword));
   await sessionStore.revokeAllForUser(hit.userId);
   emitAudit("auth.reset_consume", "ok", { userId: hit.userId, ip: clientIp(c) });
+  return c.json({ ok: true });
+});
+
+// POST /auth/verify-otp — consume a signup OTP code, verify the email, and
+// mint the normal session pair. verifySignupOtp is boolean-only (unknown
+// user, wrong code, expired code, and replay ALL answer false), so every
+// failure shares one 400 shape — no oracle distinguishes them.
+authRoutes.post("/verify-otp", async (c) => {
+  const gateVerifyOtp = await limitedAsync(c, "verify-otp"); if (gateVerifyOtp !== null) return gateVerifyOtp;
+  const body = await readJson(c);
+  const email = str(body?.["email"]).trim().toLowerCase();
+  const code = str(body?.["code"]).trim();
+  const user = EMAIL_RE.test(email) ? await userStore.findByEmail(email) : undefined;
+  const ok = user !== undefined && code !== "" && (await verifySignupOtp(user.id, code));
+  if (!ok || user === undefined) {
+    emitAudit("auth.verify_otp", "invalid_code", { ip: clientIp(c) });
+    return c.json({ error: "invalid_code" }, 400);
+  }
+  await userStore.setVerified(user.id);
+  const { pair } = await issuePair(user.id);
+  setAuthCookies(c, pair);
+  emitAudit("auth.verify_otp", "ok", { userId: user.id, ip: clientIp(c) });
+  return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true } });
+});
+
+// POST /auth/otp-resend — re-issue a signup OTP respecting the lib cooldown.
+// Always 200 { ok: true } (non-enumerating): unknown emails, verified
+// accounts, and Google-created (passwordHash null) accounts answer exactly
+// like a fresh send. Only an unverified password user gets a new code, and
+// only outside the cooldown window — a cooldown throw is swallowed so the
+// earlier code stays valid and the response stays 200.
+authRoutes.post("/otp-resend", async (c) => {
+  const gateOtpResend = await limitedAsync(c, "otp-resend"); if (gateOtpResend !== null) return gateOtpResend;
+  const body = await readJson(c);
+  const email = str(body?.["email"]).trim().toLowerCase();
+  const user = EMAIL_RE.test(email) ? await userStore.findByEmail(email) : undefined;
+  if (user !== undefined && user.passwordHash !== null && !user.emailVerified) {
+    try {
+      const code = await issueSignupOtp(user.id, user.email);
+      await sendSignupOtp(user.email, code);
+    } catch {
+      // Cooldown window: the earlier code stays valid; answer 200 below.
+    }
+  }
+  emitAudit("auth.otp_resend", "ok", { ip: clientIp(c) });
   return c.json({ ok: true });
 });
 

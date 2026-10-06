@@ -14,6 +14,8 @@ import { getIssuer } from "../src/config";
 import { hashToken, signAccess, verifyAccess } from "../src/lib/crypto";
 import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { sessionStore, userStore } from "../src/lib/store";
+import { resetSignupOtpsForTests } from "../src/lib/otp";
+import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
 
 const TAG = "task36b";
 const PREV = "test-only-previous-secret-abcdef0123456789";
@@ -46,9 +48,16 @@ async function del(path: string, ip: string, bearer?: string): Promise<Response>
 
 async function register(ip: string, email: string): Promise<{ id: string; access: string; refresh: string }> {
   const res = await post("/auth/register", { email, password: "s3cret-pass" }, ip);
-  expect(res.status).toBe(201);
-  const body = (await res.json()) as { id: string; access_token: string; refresh_token: string };
-  return { id: body.id, access: body.access_token, refresh: body.refresh_token };
+  expect(res.status).toBe(202);
+  expect(await res.json()).toEqual({ pending: true, email });
+  const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
+  expect(code).toMatch(/^\d{6}$/);
+  const verify = await post("/auth/verify-otp", { email, code }, ip);
+  expect(verify.status).toBe(200);
+  const body = (await verify.json()) as { access_token: string; refresh_token: string; user: { id: string; emailVerified: boolean } };
+  expect(typeof body.user.id).toBe("string");
+  expect(body.user.emailVerified).toBe(true);
+  return { id: body.user.id, access: body.access_token, refresh: body.refresh_token };
 }
 
 async function login(ip: string, email: string): Promise<{ access: string; refresh: string }> {
@@ -58,12 +67,29 @@ async function login(ip: string, email: string): Promise<{ access: string; refre
   return { access: body.access_token, refresh: body.refresh_token };
 }
 
+const sent: MailMessage[] = [];
+
+/** Pull the 6-digit code out of the mailed body (it travels as token=<code>). */
+function mailedCode(message: MailMessage): string {
+  const viaToken = /token=(\d{6})/.exec(message.text)?.[1];
+  if (viaToken !== undefined) return viaToken;
+  return /\d{6}/.exec(message.text)?.[0] ?? "";
+}
+
 beforeEach(() => {
+  sent.length = 0;
+  resetMailSender();
+  setMailSender(async (message) => {
+    sent.push(message);
+    return "delivered";
+  });
+  resetSignupOtpsForTests();
   resetRateLimitsForTests();
   resetThrottleConnForTests();
 });
 
 afterEach(() => {
+  resetMailSender();
   delete process.env["JWT_SECRET_PREVIOUS"];
   delete process.env["JWT_SECRET_KID"];
   delete process.env["JWT_SECRET_PREVIOUS_KID"];

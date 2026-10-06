@@ -6,7 +6,7 @@ process.env["JWT_SECRET"] = "test-only-dummy-secret-0123456789abcdef";
 process.env["ALLOW_WEAK_JWT_SECRET"] = "1";
 process.env["NODE_ENV"] = "test";
 
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
 import { app } from "../src/index";
 import { getJwtRotationKeys, getJwtSecret } from "../src/config";
@@ -14,14 +14,50 @@ import { mintPurposeToken, signAccess, verifyAccess } from "../src/lib/crypto";
 import { createRateLimiter, resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { googleStateStore, resetStoresForTests, userStore } from "../src/lib/store";
 import { getIssuer } from "../src/config";
+import { resetSignupOtpsForTests } from "../src/lib/otp";
+import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
 import { baseGoogleClaims, createGoogleTestRig, TEST_GOOGLE_CLIENT_ID } from "./google-jwks-helper";
 
 await resetStoresForTests();
 
+const sent: MailMessage[] = [];
+
 beforeEach(() => {
+  sent.length = 0;
+  resetMailSender();
+  setMailSender(async (message) => {
+    sent.push(message);
+    return "delivered";
+  });
+  resetSignupOtpsForTests();
   resetRateLimitsForTests();
   resetThrottleConnForTests();
 });
+
+afterEach(() => {
+  resetMailSender();
+});
+
+/** Pull the 6-digit code out of the mailed body (it travels as token=<code>). */
+function mailedCode(message: MailMessage): string {
+  const viaToken = /token=(\d{6})/.exec(message.text)?.[1];
+  if (viaToken !== undefined) return viaToken;
+  return /\d{6}/.exec(message.text)?.[0] ?? "";
+}
+
+/** Register (202 pending) then verify the mailed OTP, returning the session pair. */
+async function registerVerify(email: string, password: string): Promise<{ access_token: string; refresh_token: string }> {
+  const reg = await post("/auth/register", { email, password });
+  expect(reg.status).toBe(202);
+  const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
+  expect(code).toMatch(/^\d{6}$/);
+  const verify = await post("/auth/verify-otp", { email, code });
+  expect(verify.status).toBe(200);
+  const pair = (await verify.json()) as { access_token: string; refresh_token: string };
+  expect(typeof pair.access_token).toBe("string");
+  expect(typeof pair.refresh_token).toBe("string");
+  return pair;
+}
 
 async function post(path: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
   return app.request(path, {
@@ -38,11 +74,19 @@ async function authed(path: string, token: string): Promise<Response> {
 describe("register + login", () => {
   test("POST /auth/register creates an Auth user with a string id", async () => {
     const res = await post("/auth/register", { email: "alice@example.com", password: "s3cret-pass" });
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as { id: string; email: string };
-    expect(typeof body.id).toBe("string");
-    expect(body.id.length).toBeGreaterThan(0);
-    expect(body.email).toBe("alice@example.com");
+    expect(res.status).toBe(202);
+    expect(await res.json()).toEqual({ pending: true, email: "alice@example.com" });
+    expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_at="))).toBe(false);
+    expect(res.headers.getSetCookie().some((v) => v.startsWith("alcore_rt="))).toBe(false);
+    const code = mailedCode(sent.find((m) => m.to === "alice@example.com") as MailMessage);
+    expect(code).toMatch(/^\d{6}$/);
+    const verify = await post("/auth/verify-otp", { email: "alice@example.com", code });
+    expect(verify.status).toBe(200);
+    const pair = (await verify.json()) as { access_token: string; refresh_token: string };
+    const me = (await (await authed("/auth/me", pair.access_token)).json()) as { id: string; email: string };
+    expect(typeof me.id).toBe("string");
+    expect(me.id.length).toBeGreaterThan(0);
+    expect(me.email).toBe("alice@example.com");
   });
 
   test("login: unknown email and wrong password give identical 401 (no enumeration)", async () => {
@@ -70,8 +114,9 @@ describe("register + login", () => {
 
 describe("refresh rotation + logout", () => {
   test("refresh rotates; old refresh is rejected (reuse -> 401)", async () => {
-    await post("/auth/register", { email: "bob@example.com", password: "s3cret-pass" });
+    await registerVerify("bob@example.com", "s3cret-pass");
     const login = await post("/auth/login", { email: "bob@example.com", password: "s3cret-pass" });
+    expect(login.status).toBe(200);
     const first = (await login.json()) as { refresh_token: string };
     const r1 = await post("/auth/refresh", { refresh_token: first.refresh_token });
     expect(r1.status).toBe(200);
@@ -82,8 +127,9 @@ describe("refresh rotation + logout", () => {
   });
 
   test("logout revokes the session (refresh rejected after)", async () => {
-    await post("/auth/register", { email: "carol@example.com", password: "s3cret-pass" });
+    await registerVerify("carol@example.com", "s3cret-pass");
     const login = await post("/auth/login", { email: "carol@example.com", password: "s3cret-pass" });
+    expect(login.status).toBe(200);
     const pair = (await login.json()) as { access_token: string; refresh_token: string };
     const out = await post("/auth/logout", { refresh_token: pair.refresh_token });
     expect(out.status).toBe(200);
@@ -97,7 +143,7 @@ describe("verify + reset (no enumeration)", () => {
     const unknown = await post("/auth/verify/request", { email: "ghost@example.com" });
     expect(unknown.status).toBe(200);
     expect(await unknown.json()).toEqual({ ok: true });
-    await post("/auth/register", { email: "dave@example.com", password: "s3cret-pass" });
+    await registerVerify("dave@example.com", "s3cret-pass");
     const known = await post("/auth/verify/request", { email: "dave@example.com" });
     expect(known.status).toBe(200);
     expect(await known.json()).toEqual({ ok: true });
@@ -116,7 +162,7 @@ describe("verify + reset (no enumeration)", () => {
   test("reset request is always 200; consume rotates password and revokes sessions", async () => {
     const unknown = await post("/auth/reset/request", { email: "ghost2@example.com" });
     expect(unknown.status).toBe(200);
-    await post("/auth/register", { email: "erin@example.com", password: "old-pass-123" });
+    await registerVerify("erin@example.com", "old-pass-123");
     const login = await post("/auth/login", { email: "erin@example.com", password: "old-pass-123" });
     const { access_token } = (await login.json()) as { access_token: string };
     const me = (await (await authed("/auth/me", access_token)).json()) as { id: string };
@@ -141,9 +187,13 @@ describe("purpose links reached by GET (as emailed)", () => {
   }
 
   async function registerAndId(email: string, password: string): Promise<string> {
-    await post("/auth/register", { email, password });
-    const login = await post("/auth/login", { email, password });
-    const { access_token } = (await login.json()) as { access_token: string };
+    const reg = await post("/auth/register", { email, password });
+    expect(reg.status).toBe(202);
+    const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
+    expect(code).toMatch(/^\d{6}$/);
+    const verify = await post("/auth/verify-otp", { email, code });
+    expect(verify.status).toBe(200);
+    const { access_token } = (await verify.json()) as { access_token: string };
     const me = (await (await authed("/auth/me", access_token)).json()) as { id: string };
     return me.id;
   }
@@ -162,9 +212,12 @@ describe("purpose links reached by GET (as emailed)", () => {
   test("GET does not consume the token, so a link scanner cannot burn it", async () => {
     const id = await registerAndId("getlink2@example.com", "s3cret-pass");
     const token = mintPurposeToken(getJwtSecret(), "verify", id, 3600);
+    const before = await userStore.findById(id);
     await app.request(`/auth/verify/consume?token=${encodeURIComponent(token)}`);
-    const user = await userStore.findById(id);
-    expect(user?.emailVerified).toBe(false);
+    const after = await userStore.findById(id);
+    expect(after?.emailVerified).toBe(before?.emailVerified);
+    // The token survived GET untouched: consuming it via POST still works.
+    expect((await post("/auth/verify/consume", { token })).status).toBe(200);
   });
 
   test("the emailed form post verifies the account", async () => {
@@ -425,11 +478,15 @@ describe("OIDC code flow", () => {
   const clientId = "test-client";
 
   async function getSessionToken(email: string): Promise<string> {
-    await post("/auth/register", { email, password: "s3cret-pass" });
-    const login = await post("/auth/login", { email, password: "s3cret-pass" });
-    const body: unknown = await login.json();
+    const reg = await post("/auth/register", { email, password: "s3cret-pass" });
+    expect(reg.status).toBe(202);
+    const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
+    expect(code).toMatch(/^\d{6}$/);
+    const verify = await post("/auth/verify-otp", { email, code });
+    expect(verify.status).toBe(200);
+    const body: unknown = await verify.json();
     if (typeof body !== "object" || body === null || !("access_token" in body) || typeof body.access_token !== "string") {
-      throw new Error("login did not return an access token");
+      throw new Error("verify did not return an access token");
     }
     return body.access_token;
   }
@@ -559,10 +616,13 @@ describe("change password (POST /auth/change)", () => {
   }
 
   async function registerAndLogin(email: string, password: string): Promise<{ access_token: string; refresh_token: string }> {
-    await post("/auth/register", { email, password });
-    const login = await post("/auth/login", { email, password });
-    expect(login.status).toBe(200);
-    return (await login.json()) as { access_token: string; refresh_token: string };
+    const reg = await post("/auth/register", { email, password });
+    expect(reg.status).toBe(202);
+    const code = mailedCode(sent.find((m) => m.to === email) as MailMessage);
+    expect(code).toMatch(/^\d{6}$/);
+    const verify = await post("/auth/verify-otp", { email, code });
+    expect(verify.status).toBe(200);
+    return (await verify.json()) as { access_token: string; refresh_token: string };
   }
 
   test("happy path: change works, new password logs in, old password 401s", async () => {

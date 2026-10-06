@@ -8,19 +8,41 @@ process.env["NODE_ENV"] = "test";
 process.env["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com";
 process.env["GOOGLE_CLIENT_SECRET"] = "test-client-secret";
 
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { app } from "../src/index";
 import { getGoogleRedirectUri } from "../src/config";
 import { resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
 import { googleStateStore, resetStoresForTests, userStore } from "../src/lib/store";
+import { resetSignupOtpsForTests } from "../src/lib/otp";
+import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
 import { baseGoogleClaims, createGoogleTestRig, TEST_GOOGLE_CLIENT_ID } from "./google-jwks-helper";
 
 await resetStoresForTests();
 
+const sent: MailMessage[] = [];
+
 beforeEach(() => {
+  sent.length = 0;
+  resetMailSender();
+  setMailSender(async (message) => {
+    sent.push(message);
+    return "delivered";
+  });
+  resetSignupOtpsForTests();
   resetRateLimitsForTests();
   resetThrottleConnForTests();
 });
+
+afterEach(() => {
+  resetMailSender();
+});
+
+/** Pull the 6-digit code out of the mailed body (it travels as token=<code>). */
+function mailedCode(message: MailMessage): string {
+  const viaToken = /token=(\d{6})/.exec(message.text)?.[1];
+  if (viaToken !== undefined) return viaToken;
+  return /\d{6}/.exec(message.text)?.[0] ?? "";
+}
 
 async function post(path: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
   return app.request(path, {
@@ -335,7 +357,10 @@ describe("todo35: adversarial negatives fail closed with generic errors", () => 
   test("unregistered OIDC callback fails closed without redirecting", async () => {
     process.env["AUTH_OIDC_CLIENTS"] = `test-client=http://localhost:3000/callback`;
     const email = uniqueEmail("cbx");
-    await post("/auth/register", { email, password: "s3cret-pass" });
+    const reg = await post("/auth/register", { email, password: "s3cret-pass" });
+    expect(reg.status).toBe(202);
+    const verify = await post("/auth/verify-otp", { email, code: mailedCode(sent[0] as MailMessage) });
+    expect(verify.status).toBe(200);
     const login = (await (await post("/auth/login", { email, password: "s3cret-pass" })).json()) as {
       access_token: string;
     };
