@@ -14,6 +14,14 @@ import { getGoogleClientId } from "../config";
 export interface VerifiedGoogleProfile {
   readonly subject: string;
   readonly email: string;
+  // Pass-through ONLY: name/picture come from the already-received,
+  // signature-verified ID token and are handed to the completing client
+  // once at login completion so the product can provision its own profile
+  // (products own profiles; auth stores nothing — no tables, no columns).
+  // Present only when the verified token carried a usable value; absent
+  // values are omitted, never defaulted or forged.
+  readonly name?: string;
+  readonly picture?: string;
 }
 
 export class GoogleCredentialError extends Error {
@@ -160,5 +168,21 @@ export async function verifyGoogleCredential(
   ) {
     throw new GoogleCredentialError();
   }
-  return { subject: record["sub"] as string, email: (record["email"] as string).trim().toLowerCase() };
+  // Profile pass-through: name/picture are read from the SAME verified
+  // claims object above (signature, iss/aud/exp/nonce/email_verified all
+  // checked) — never from an unverified source. Non-string, empty, or
+  // over-long values are dropped (omitted downstream, never forged); the
+  // picture must be an https URL, matching what Google issues.
+  const nameRaw = record["name"];
+  const pictureRaw = record["picture"];
+  const name = typeof nameRaw === "string" ? nameRaw.trim() : "";
+  const picture = typeof pictureRaw === "string" ? pictureRaw.trim() : "";
+  return {
+    subject: record["sub"] as string,
+    email: (record["email"] as string).trim().toLowerCase(),
+    ...(name !== "" && name.length <= 256 ? { name } : {}),
+    ...(picture !== "" && picture.length <= 2048 && picture.startsWith("https://")
+      ? { picture }
+      : {}),
+  };
 }

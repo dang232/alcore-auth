@@ -23,7 +23,7 @@ import {
 import { googleStateStore, markPurposeConsumed, productExchangeStore, userStore, sessionStore } from "../lib/store";
 import { verifyPasswordCompat } from "../lib/legacy-password";
 import { emitAudit } from "../lib/audit";
-import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential } from "../lib/google";
+import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential, type VerifiedGoogleProfile } from "../lib/google";
 import type { Session } from "../lib/store";
 import { limitedAsync as throttleGuard } from "../lib/ratelimit";
 import { deliverPurposeMail } from "../lib/mail";
@@ -344,6 +344,21 @@ function clearAuthCookies(c: Context): void {
 async function userView(userId: string): Promise<{ id: string; email: string; emailVerified: boolean } | null> {
   const u = await userStore.findById(userId);
   return u === undefined ? null : { id: u.id, email: u.email, emailVerified: u.emailVerified };
+}
+
+// Verified Google profile pass-through (products own profiles): the
+// completing client receives the signature-verified name/picture once, in
+// the login completion payload, so its product can provision its own
+// profile. Auth persists nothing — no tables, no columns. The `profile`
+// key is omitted entirely when the verified token carried no usable
+// claims; values are never defaulted or forged.
+function googleCompletionProfile(
+  profile: Pick<VerifiedGoogleProfile, "name" | "picture">,
+): {} | { profile: { name?: string; picture?: string } } {
+  const claims: { name?: string; picture?: string } = {};
+  if (profile.name !== undefined) claims.name = profile.name;
+  if (profile.picture !== undefined) claims.picture = profile.picture;
+  return Object.keys(claims).length === 0 ? {} : { profile: claims };
 }
 
 export const authRoutes = new Hono();
@@ -839,7 +854,7 @@ authRoutes.post("/google/verify", async (c) => {
   const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ access_token: pair.access_token });
+  return c.json({ access_token: pair.access_token, ...googleCompletionProfile(profile) });
 });
 
 // Desktop loopback exchange (desktop Google login): the desktop loopback
@@ -951,7 +966,7 @@ authRoutes.post("/google/desktop-code", async (c) => {
   const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ access_token: pair.access_token });
+  return c.json({ access_token: pair.access_token, ...googleCompletionProfile(profile) });
 });
 
 // Google → product handoff (e.g. Libre full-page Google login chaining back).
@@ -1211,5 +1226,5 @@ authRoutes.get("/google/callback", async (c) => {
   }
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
   if (wantsHtml(c)) return c.html(googleSignedInPage(), 200);
-  return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true } });
+  return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true }, ...googleCompletionProfile(profile) });
 });
