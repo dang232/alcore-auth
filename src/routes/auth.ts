@@ -842,6 +842,118 @@ authRoutes.post("/google/verify", async (c) => {
   return c.json({ access_token: pair.access_token });
 });
 
+// Desktop loopback exchange (desktop Google login): the desktop loopback
+// server captures the authorization code in the SYSTEM browser (plain OAuth
+// redirect — never the GIS JavaScript flow, whose authorized origins cannot
+// cover dynamic loopback ports) and redeems it here, where the confidential
+// client secret lives (env only; desktops never hold it). The redirect_uri
+// MUST be the desktop loopback callback: Google's installed-app exemption
+// accepts http://127.0.0.1 (or localhost) with any port without
+// registration, while the production https callback stays the only
+// registered URI for browser flows. JSON only (server-to-server).
+function isDesktopLoopbackRedirectUri(value: string): boolean {
+  const match = /^http:\/\/(127\.0\.0\.1|localhost):(\d{1,5})\/auth\/desktop-google\/callback$/.exec(
+    value.trim(),
+  );
+  if (match?.[2] === undefined) return false;
+  const port = Number(match[2]);
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
+authRoutes.post("/google/desktop-code", async (c) => {
+  const gateDesktopCode = await limitedAsync(c, "google-verify");
+  if (gateDesktopCode !== null) return gateDesktopCode;
+  const body = await readJson(c);
+  const code = str(body?.["code"]);
+  const redirectUri = str(body?.["redirect_uri"]);
+  const codeVerifier = str(body?.["code_verifier"]);
+  const nonce = str(body?.["nonce"]);
+  if (
+    code === "" || code.length > 2048 ||
+    !isDesktopLoopbackRedirectUri(redirectUri) ||
+    (codeVerifier !== "" &&
+      (codeVerifier.length < 43 || codeVerifier.length > 128 ||
+        !/^[A-Za-z0-9\-._~]+$/.test(codeVerifier))) ||
+    nonce.length > 128
+  ) {
+    emitAudit("auth.oauth_callback", "invalid_request", { ip: clientIp(c) });
+    return c.json({ error: "invalid_request" }, 400);
+  }
+  const clientId = getGoogleClientId();
+  const clientSecret = (process.env["GOOGLE_CLIENT_SECRET"] ?? "").trim();
+  if (clientId === "" || clientSecret === "") {
+    emitAudit("auth.oauth_callback", "google_not_configured", { ip: clientIp(c) });
+    return c.json({ error: "google_not_configured" }, 503);
+  }
+  let tokenResponse: Response;
+  try {
+    tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: redirectUri.trim(),
+        grant_type: "authorization_code",
+        ...(codeVerifier === "" ? {} : { code_verifier: codeVerifier }),
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    emitAudit("auth.oauth_callback", "upstream_unavailable", { ip: clientIp(c) });
+    return c.json({ error: "upstream_unavailable" }, 503);
+  }
+  if (!tokenResponse.ok) {
+    emitAudit("auth.oauth_callback", "invalid_google_credential", { ip: clientIp(c) });
+    return c.json({ error: "invalid_google_credential" }, 401);
+  }
+  let tokenBody: unknown;
+  try {
+    tokenBody = await tokenResponse.json();
+  } catch {
+    emitAudit("auth.oauth_callback", "upstream_unavailable", { ip: clientIp(c) });
+    return c.json({ error: "upstream_unavailable" }, 503);
+  }
+  if (typeof tokenBody !== "object" || tokenBody === null || typeof (tokenBody as Record<string, unknown>)["id_token"] !== "string") {
+    emitAudit("auth.oauth_callback", "invalid_google_credential", { ip: clientIp(c) });
+    return c.json({ error: "invalid_google_credential" }, 401);
+  }
+  let profile;
+  try {
+    profile = await verifyGoogleCredential(
+      String((tokenBody as Record<string, unknown>)["id_token"]),
+      nonce === "" ? undefined : nonce,
+    );
+  } catch (error) {
+    if (error instanceof GoogleCredentialError) {
+      emitAudit("auth.oauth_callback", "invalid_google_credential", { ip: clientIp(c) });
+      return c.json({ error: "invalid_google_credential" }, 401);
+    }
+    if (error instanceof GoogleUpstreamError) {
+      emitAudit("auth.oauth_callback", "upstream_unavailable", { ip: clientIp(c) });
+      return c.json({ error: "upstream_unavailable" }, 503);
+    }
+    throw error;
+  }
+  const existing = await userStore.findByProviderSub("google", profile.subject);
+  const emailUser = await userStore.findByEmail(profile.email);
+  if (existing !== undefined && emailUser !== undefined && existing.id !== emailUser.id) {
+    emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
+    return c.json({ error: "identity_conflict" }, 409);
+  }
+  const user = existing ?? emailUser ?? (await userStore.create(profile.email, null));
+  await userStore.setVerified(user.id);
+  if ((await userStore.linkIdentity(user.id, "google", profile.subject)) === "owned_by_other_user") {
+    emitAudit("auth.identity_conflict", "identity_conflict", { ip: clientIp(c) });
+    return c.json({ error: "identity_conflict" }, 409);
+  }
+  const { pair } = await issuePair(user.id);
+  setAuthCookies(c, pair);
+  emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
+  return c.json({ access_token: pair.access_token });
+});
+
 // Google → product handoff (e.g. Libre full-page Google login chaining back).
 // Local mirrors of oidc.ts PRODUCT_INTENT / PRODUCT_EXCHANGE_TTL_SECONDS:
 // kept as literals here to minimize cross-file churn; if oidc.ts changes
