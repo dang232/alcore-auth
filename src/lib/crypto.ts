@@ -283,7 +283,10 @@ export function hashEqual(a: string, b: string): boolean {
 export const USER_TOKEN_TTL_SECONDS = 600;
 export const USER_TOKEN_AUDIENCE = "tokenpanel";
 export const USER_TOKEN_INTENT = "ide_read";
-export const USER_TOKEN_SCOPES = ["profile:read", "quota:read", "tier:read"] as const;
+// Task 43: `models:read` lets the TokenPanel IDE list the org model catalog
+// (GET /v1/models) on a user JWT. Additive — existing atoms unchanged.
+// IDE_DESKTOP_SCOPES aliases this list, so desktop logins grant it too.
+export const USER_TOKEN_SCOPES = ["profile:read", "quota:read", "tier:read", "models:read"] as const;
 export type UserTokenScope = (typeof USER_TOKEN_SCOPES)[number];
 
 export interface UserTokenClaims {
