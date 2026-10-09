@@ -264,6 +264,13 @@ describe("desktop-code completion issues the IDE pair", () => {
 });
 
 describe("POST /auth/token/refresh", () => {
+  test("accepts snake_case refresh_token (IDE caller shape) same as refreshToken", async () => {
+    const { userToken } = await desktopLogin();
+    const res = await post("/auth/token/refresh", { refresh_token: userToken.refresh_token }, freshIp());
+    expect(res.status).toBe(200);
+    const rotated = (await res.json()) as UserTokenPairBody;
+    expect(rotated.token_type).toBe("Bearer");
+  });
   test("rotates to a fresh pair preserving scopes; old refresh is single-use", async () => {
     const { userToken, userId } = await desktopLogin();
     const first = await post("/auth/token/refresh", { refreshToken: userToken.refresh_token }, freshIp());

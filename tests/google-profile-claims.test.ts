@@ -216,8 +216,9 @@ describe("google profile pass-through: POST /auth/google/desktop-code", () => {
       const body = (await res.json()) as Record<string, unknown>;
       expect("profile" in body).toBe(false);
       // Desktop login also mints the user-scoped IDE pair (task 38); the
-      // profile key stays omitted while user_token is present.
-      expect(Object.keys(body).sort()).toEqual(["access_token", "user_token"]);
+      // profile key stays omitted while user_token is present. The refresh
+      // rides top-level too (flattened for IDE keychain capture).
+      expect(Object.keys(body).sort()).toEqual(["access_token", "refresh_token", "user_token"]);
     } finally {
       ctl.restore();
     }

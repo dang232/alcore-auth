@@ -539,7 +539,7 @@ authRoutes.post("/refresh", async (c) => {
 });
 
 // POST /auth/token/refresh — user-scoped IDE pair rotation (project-ide
-// task 38). Body { refreshToken }: single-use opaque refresh, stored hashed
+// task 38). Body { refreshToken } (also accepts snake_case refresh_token): single-use opaque refresh, stored hashed
 // with ~30 d expiry; rotation mints a fresh pair with the family's scopes and
 // reuse of a rotated-out token revokes the whole family (theft signal).
 // Every failure — missing/malformed/unknown/expired/reused — answers the
@@ -549,7 +549,7 @@ authRoutes.post("/token/refresh", async (c) => {
   const gateUserRefresh = await limitedAsync(c, "refresh");
   if (gateUserRefresh !== null) return gateUserRefresh;
   const body = await readJson(c);
-  const presented = str(body?.["refreshToken"]);
+  const presented = str(body?.["refreshToken"]) || str(body?.["refresh_token"]);
   if (presented === "" || presented.length > 512) {
     emitAudit("auth.user_token_refresh", "invalid_grant", { ip: clientIp(c) });
     return c.json({ error: "invalid_grant" }, 401);
@@ -1072,7 +1072,7 @@ authRoutes.post("/google/desktop-code", async (c) => {
   // full desktop scope set. Session cookies/URIs/OTP flows above untouched.
   const userToken = await issueUserTokenPair(user.id, IDE_DESKTOP_SCOPES);
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ access_token: pair.access_token, user_token: userToken, ...googleCompletionProfile(profile) });
+  return c.json({ access_token: pair.access_token, refresh_token: userToken.refresh_token, user_token: userToken, ...googleCompletionProfile(profile) });
 });
 
 // Google → product handoff (e.g. Libre full-page Google login chaining back).
