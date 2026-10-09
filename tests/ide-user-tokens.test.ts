@@ -207,7 +207,7 @@ describe("user-token crypto (unit)", () => {
   });
 
   test("scope allowlist is exact: empty/unknown rejected at mint", () => {
-    expect(isValidUserTokenScopeSet(["profile:read", "quota:read", "tier:read", "models:read"])).toBe(true);
+    expect(isValidUserTokenScopeSet(["profile:read", "quota:read", "tier:read", "models:read", "subscription:read", "usage:read"])).toBe(true);
     expect(isValidUserTokenScopeSet(["models:read"])).toBe(true);
     expect(isValidUserTokenScopeSet([])).toBe(false);
     expect(isValidUserTokenScopeSet(["quota:read", "admin:write"])).toBe(false);
@@ -239,7 +239,7 @@ describe("desktop-code completion issues the IDE pair", () => {
       const userToken = body.user_token as UserTokenPairBody;
       expect(userToken.token_type).toBe("Bearer");
       expect(userToken.expires_in).toBe(600);
-      expect(userToken.scope).toEqual(["profile:read", "quota:read", "tier:read", "models:read"]);
+      expect(userToken.scope).toEqual(["profile:read", "quota:read", "tier:read", "models:read", "subscription:read", "usage:read"]);
       expect(typeof userToken.access_token).toBe("string");
       expect(typeof userToken.refresh_token).toBe("string");
       expect(/^[0-9a-f]{64}$/.test(userToken.refresh_token)).toBe(true);
@@ -257,7 +257,7 @@ describe("desktop-code completion issues the IDE pair", () => {
       // Refresh is stored hashed server-side, never plaintext.
       const stored = await ideRefreshStore.findByTokenHash(hashToken(userToken.refresh_token));
       expect(stored?.userId).toBe(view.id);
-      expect(stored?.scopes).toEqual(["profile:read", "quota:read", "tier:read", "models:read"]);
+      expect(stored?.scopes).toEqual(["profile:read", "quota:read", "tier:read", "models:read", "subscription:read", "usage:read"]);
     } finally {
       restore();
     }
@@ -279,7 +279,7 @@ describe("POST /auth/token/refresh", () => {
     const rotated = (await first.json()) as UserTokenPairBody;
     expect(rotated.token_type).toBe("Bearer");
     expect(rotated.expires_in).toBe(600);
-    expect(rotated.scope).toEqual(["profile:read", "quota:read", "tier:read", "models:read"]);
+    expect(rotated.scope).toEqual(["profile:read", "quota:read", "tier:read", "models:read", "subscription:read", "usage:read"]);
     expect(rotated.refresh_token).not.toBe(userToken.refresh_token);
     const firstPayload = verifyUserToken(userToken.access_token, getJwtRotationKeys(), getIssuer());
     const nextPayload = verifyUserToken(rotated.access_token, getJwtRotationKeys(), getIssuer());
