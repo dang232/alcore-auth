@@ -91,8 +91,23 @@ CREATE TABLE IF NOT EXISTS google_states (
   expires_at BIGINT NOT NULL
 );
 
+-- User-scoped IDE refresh families (project-ide task 38). One row per login
+-- chain: live opaque-refresh digest + rotated-out digests (reuse = revoke
+-- family). Scopes ride the family. Keyed by digest, never the token.
+CREATE TABLE IF NOT EXISTS ide_refresh_tokens (
+  family_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  previous_hashes TEXT NOT NULL DEFAULT '[]',
+  scopes TEXT NOT NULL DEFAULT '[]',
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  revoked SMALLINT NOT NULL DEFAULT 0
+);
+
 -- DOWN (retire-only; never run against a live backend — cutover rollback is
 -- the SQLite snapshot + AUTH_STORE_BACKEND flip, see runbook):
+-- DROP TABLE IF EXISTS ide_refresh_tokens;
 -- DROP TABLE IF EXISTS google_states;
 -- DROP TABLE IF EXISTS product_exchange_redirects;
 -- DROP TABLE IF EXISTS product_exchange_codes;

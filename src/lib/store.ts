@@ -21,9 +21,11 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { getAuthDatabasePath, getAuthStoreBackend, getDatabaseUrl, nodeEnv } from "../config";
-import { verifyPkceS256 } from "./crypto";
+import { hashEqual, verifyPkceS256 } from "./crypto";
 import type {
   GoogleStateStore,
+  IdeRefreshRecord,
+  IdeRefreshStore,
   OidcCode,
   OidcStore,
   ProductAudience,
@@ -39,6 +41,8 @@ import { PROVISION_LEDGER_SQLITE_DDL } from "./provision-ledger-schema";
 
 export type {
   GoogleStateStore,
+  IdeRefreshRecord,
+  IdeRefreshStore,
   IdentityLinkResult,
   OidcCode,
   OidcStore,
@@ -123,6 +127,20 @@ db.run(`
     state TEXT PRIMARY KEY,
     nonce TEXT NOT NULL,
     expires_at INTEGER NOT NULL
+  );
+  -- User-scoped IDE refresh families (project-ide task 38). One row per
+  -- login chain: live opaque-refresh digest + rotated-out digests (reuse =
+  -- revoke family). Scopes ride the family so rotation re-mints the same
+  -- least-privilege set. Keyed by digest, never the token.
+  CREATE TABLE IF NOT EXISTS ide_refresh_tokens (
+    family_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    previous_hashes TEXT NOT NULL DEFAULT '[]',
+    scopes TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
 `);
@@ -300,6 +318,91 @@ const sqliteSessionStore = {
   },
 };
 
+function ideRefreshFromRow(row: Row | null): IdeRefreshRecord | undefined {
+  if (row === null) return undefined;
+  let scopes: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(String(row["scopes"]));
+    if (Array.isArray(parsed)) scopes = parsed.filter((s): s is string => typeof s === "string");
+  } catch {
+    scopes = [];
+  }
+  return {
+    familyId: String(row["family_id"]),
+    userId: String(row["user_id"]),
+    tokenHash: String(row["token_hash"]),
+    prevHashes: new Set(JSON.parse(String(row["previous_hashes"])) as string[]),
+    scopes,
+    createdAt: Number(row["created_at"]),
+    expiresAt: Number(row["expires_at"]),
+    revoked: Number(row["revoked"]) === 1,
+  };
+}
+
+const sqliteIdeRefreshStore = {
+  issue(userId: string, tokenHash: string, scopes: readonly string[], ttlMs: number): IdeRefreshRecord {
+    const now = Date.now();
+    const record: IdeRefreshRecord = {
+      familyId: crypto.randomUUID(),
+      userId,
+      tokenHash,
+      prevHashes: new Set<string>(),
+      scopes: [...scopes],
+      createdAt: now,
+      expiresAt: now + ttlMs,
+      revoked: false,
+    };
+    db.query(
+      "INSERT INTO ide_refresh_tokens (family_id,user_id,token_hash,previous_hashes,scopes,created_at,expires_at,revoked) VALUES (?,?,?,?,?,?,?,0)",
+    ).run(
+      record.familyId, record.userId, record.tokenHash, "[]", JSON.stringify(record.scopes),
+      record.createdAt, record.expiresAt,
+    );
+    return record;
+  },
+  findByTokenHash(hash: string): IdeRefreshRecord | undefined {
+    return ideRefreshFromRow(db.query("SELECT * FROM ide_refresh_tokens WHERE token_hash=?").get(hash) as Row | null);
+  },
+  findByTokenOrPrevHash(hash: string): IdeRefreshRecord | undefined {
+    const live = db.query("SELECT * FROM ide_refresh_tokens WHERE token_hash=?").get(hash) as Row | null;
+    if (live !== null) return ideRefreshFromRow(live);
+    // Prev-hash lookup is a candidate fetch only: the caller confirms with
+    // the constant-time isReusedHash below, so LIKE is not an oracle.
+    const rows = db.query("SELECT * FROM ide_refresh_tokens WHERE previous_hashes LIKE ?").all(`%${hash}%`) as Row[];
+    for (const row of rows) {
+      const record = ideRefreshFromRow(row);
+      if (record !== undefined && sqliteIdeRefreshStore.isReusedHash(record, hash)) return record;
+    }
+    return undefined;
+  },
+  /**
+   * Atomic compare-and-swap rotation: the single UPDATE only wins when the
+   * family row still holds the presented hash and is not revoked, so two
+   * concurrent refreshes yield exactly one winner. Returns true on win; on
+   * loss the in-memory record is left untouched.
+   */
+  rotate(record: IdeRefreshRecord, nextHash: string): boolean {
+    const merged = [...record.prevHashes, record.tokenHash];
+    const row = db.query(
+      "UPDATE ide_refresh_tokens SET token_hash=?,previous_hashes=? WHERE family_id=? AND token_hash=? AND revoked=0 RETURNING family_id",
+    ).get(nextHash, JSON.stringify(merged), record.familyId, record.tokenHash) as Row | null;
+    if (row === null) return false;
+    record.prevHashes.add(record.tokenHash);
+    record.tokenHash = nextHash;
+    return true;
+  },
+  isReusedHash(record: IdeRefreshRecord, hash: string): boolean {
+    let hit = false;
+    for (const prev of record.prevHashes) {
+      if (hashEqual(prev, hash)) hit = true;
+    }
+    return hit;
+  },
+  revokeFamily(familyId: string): void {
+    db.query("UPDATE ide_refresh_tokens SET revoked=1 WHERE family_id=?").run(familyId);
+  },
+};
+
 const sqliteOidcStore = {
   issue(
     userId: string,
@@ -472,6 +575,7 @@ const sqliteGoogleStateStore = {
 };
 
 function sqliteResetStoresForTests(): void {
+  db.run("DELETE FROM ide_refresh_tokens");
   db.run("DELETE FROM provisioning_ledger");
   db.run("DELETE FROM consumed_purpose_tokens");
   db.run("DELETE FROM product_exchange_redirects");
@@ -587,6 +691,32 @@ export const sessionStore: SessionStore = {
     usePostgres()
       ? pgStores().sessionStore.revokeByIdForUser(id, userId)
       : Promise.resolve(sqliteSessionStore.revokeByIdForUser(id, userId)),
+};
+
+export const ideRefreshStore: IdeRefreshStore = {
+  issue: (userId, tokenHash, scopes, ttlMs) =>
+    usePostgres()
+      ? pgStores().ideRefreshStore.issue(userId, tokenHash, scopes, ttlMs)
+      : Promise.resolve(sqliteIdeRefreshStore.issue(userId, tokenHash, scopes, ttlMs)),
+  findByTokenHash: (hash) =>
+    usePostgres()
+      ? pgStores().ideRefreshStore.findByTokenHash(hash)
+      : Promise.resolve(sqliteIdeRefreshStore.findByTokenHash(hash)),
+  findByTokenOrPrevHash: (hash) =>
+    usePostgres()
+      ? pgStores().ideRefreshStore.findByTokenOrPrevHash(hash)
+      : Promise.resolve(sqliteIdeRefreshStore.findByTokenOrPrevHash(hash)),
+  rotate: (record, nextHash) =>
+    usePostgres()
+      ? pgStores().ideRefreshStore.rotate(record, nextHash)
+      : Promise.resolve(sqliteIdeRefreshStore.rotate(record, nextHash)),
+  isReusedHash: (record, hash) =>
+    // Pure constant-time predicate — identical on both backends by construction.
+    sqliteIdeRefreshStore.isReusedHash(record, hash),
+  revokeFamily: (familyId) =>
+    usePostgres()
+      ? pgStores().ideRefreshStore.revokeFamily(familyId)
+      : Promise.resolve(sqliteIdeRefreshStore.revokeFamily(familyId)),
 };
 
 export const oidcStore: OidcStore = {

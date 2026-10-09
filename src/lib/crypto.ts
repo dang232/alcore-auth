@@ -247,9 +247,183 @@ export function verifyPurposeToken(secret: string, expected: Purpose, token: str
   }
   const payload = `v1.${expected}.${userId}.${expRaw}`;
   const want = hmacHex(secret, payload);
-  // Compare hex strings in constant time via sha256 digests (see AlRepo safeHashEqual).
-  const da = createHash("sha256").update(sig, "utf8").digest();
-  const db = createHash("sha256").update(want, "utf8").digest();
-  if (!timingSafeEqual(da, db)) throw new TokenError("invalid token");
+  if (!hashEqual(sig, want)) throw new TokenError("invalid token");
   return { userId };
+}
+
+/**
+ * Constant-time string equality (length + timingSafeEqual on the sha256
+ * digests, so unequal lengths do not early-exit with a timing signal).
+ * Used for opaque-token digest compares where the caller must not leak
+ * which candidate matched (refresh reuse detection, purpose HMACs).
+ */
+export function hashEqual(a: string, b: string): boolean {
+  const da = createHash("sha256").update(a, "utf8").digest();
+  const db = createHash("sha256").update(b, "utf8").digest();
+  return da.length === db.length && timingSafeEqual(da, db);
+}
+
+// --- User-scoped IDE tokens (project-ide task 38) ---
+//
+// Minted at desktop Google-login completion for the IDE, which stores the
+// pair in the OS keychain and presents the access token as
+// `Authorization: Bearer <access>` to TokenPanel IDE reads. TokenPanel
+// verifies these DIRECTLY with the shared secret set (operator provisions
+// AUTH_JWT_SECRET to the same bytes as this service's JWT_SECRET) and the
+// existing KIDs: sign ALWAYS with `current`, verify tries current then
+// previous while configured, kid-bound exactly like verifyAccess above.
+//
+// Claims: sub (opaque alcore identity), scope (array subset of
+// USER_TOKEN_SCOPES), jti (unique per access token), iss (authority),
+// aud tokenpanel (consuming product), intent ide_read (distinct from the
+// session/product_exchange/oidc intents so existing verifiers reject these
+// fail-closed), exp 10 min, iat. No email, no sid: TokenPanel enforces
+// self-only by matching query authUserId == sub server-side.
+
+export const USER_TOKEN_TTL_SECONDS = 600;
+export const USER_TOKEN_AUDIENCE = "tokenpanel";
+export const USER_TOKEN_INTENT = "ide_read";
+export const USER_TOKEN_SCOPES = ["profile:read", "quota:read", "tier:read"] as const;
+export type UserTokenScope = (typeof USER_TOKEN_SCOPES)[number];
+
+export interface UserTokenClaims {
+  readonly sub: string;
+  readonly scope: readonly string[];
+  readonly iss: string;
+}
+
+export interface UserTokenPayload {
+  readonly sub: string;
+  readonly scope: string[];
+  readonly jti: string;
+  readonly iss: string;
+  readonly aud: string;
+  readonly exp: number;
+  readonly iat: number;
+  readonly intent: string;
+}
+
+/** True when every entry is a known IDE scope (non-empty array). */
+export function isValidUserTokenScopeSet(scopes: unknown): scopes is UserTokenScope[] {
+  if (!Array.isArray(scopes) || scopes.length === 0) return false;
+  const allowed = new Set<string>(USER_TOKEN_SCOPES);
+  return scopes.every((s) => typeof s === "string" && allowed.has(s));
+}
+
+export function signUserToken(
+  claims: UserTokenClaims,
+  secret: string,
+  ttlSeconds: number = USER_TOKEN_TTL_SECONDS,
+  opts?: { readonly kid?: string },
+): string {
+  if (typeof claims.sub !== "string" || claims.sub === "" || claims.sub.length > 256) {
+    throw new JwtError("malformed payload");
+  }
+  if (typeof claims.iss !== "string" || claims.iss === "") throw new JwtError("malformed payload");
+  if (!isValidUserTokenScopeSet(claims.scope)) throw new JwtError("malformed payload");
+  const header: Record<string, string> =
+    opts?.kid === undefined || opts.kid === ""
+      ? { alg: JWT_ALG, typ: JWT_TYP }
+      : { alg: JWT_ALG, typ: JWT_TYP, kid: opts.kid };
+  const now = Math.floor(Date.now() / 1000);
+  const payload: UserTokenPayload = {
+    sub: claims.sub,
+    scope: [...claims.scope],
+    jti: crypto.randomUUID(),
+    iss: claims.iss,
+    aud: USER_TOKEN_AUDIENCE,
+    exp: now + ttlSeconds,
+    iat: now,
+    intent: USER_TOKEN_INTENT,
+  };
+  const data = `${b64UrlEncode(JSON.stringify(header))}.${b64UrlEncode(JSON.stringify(payload))}`;
+  return `${data}.${signData(data, secret)}`;
+}
+
+export class UserTokenError extends Error {}
+
+/**
+ * Verify a user-scoped IDE access token against the rotation key set.
+ * Throws UserTokenError on ANY defect (callers collapse to 401, no oracle).
+ */
+export function verifyUserToken(
+  token: string,
+  secret: string | JwtKeySet,
+  expectedIss: string,
+): UserTokenPayload {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new UserTokenError("malformed jwt");
+  const [headerEnc, payloadEnc, sig] = parts;
+  if (headerEnc === undefined || payloadEnc === undefined || sig === undefined) {
+    throw new UserTokenError("malformed jwt");
+  }
+  let header: unknown;
+  let payload: unknown;
+  try {
+    header = JSON.parse(b64UrlDecode(headerEnc));
+    payload = JSON.parse(b64UrlDecode(payloadEnc));
+  } catch {
+    throw new UserTokenError("malformed jwt");
+  }
+  if (typeof header !== "object" || header === null || !("alg" in header) || header.alg !== JWT_ALG) {
+    throw new UserTokenError("unsupported alg");
+  }
+  const tokenKid = "kid" in header && typeof header.kid === "string" && header.kid !== "" ? header.kid : null;
+  const keySet: JwtKeySet = typeof secret === "string" ? { current: secret, currentKid: "" } : secret;
+  if (tokenKid !== null) {
+    const known =
+      (keySet.currentKid !== "" && tokenKid === keySet.currentKid) ||
+      (keySet.previousKid !== undefined && tokenKid === keySet.previousKid);
+    if (!known) throw new UserTokenError("unknown kid");
+  }
+  const candidates: string[] =
+    tokenKid === null
+      ? (keySet.previous === undefined ? [keySet.current] : [keySet.current, keySet.previous])
+      : tokenKid === keySet.previousKid && keySet.previous !== undefined
+        ? [keySet.previous]
+        : [keySet.current];
+  const data = `${headerEnc}.${payloadEnc}`;
+  let presented: Uint8Array;
+  try {
+    presented = b64UrlDecodeBytes(sig);
+  } catch {
+    throw new UserTokenError("malformed jwt");
+  }
+  let signatureOk = false;
+  for (const candidate of candidates) {
+    let expected: Uint8Array;
+    try {
+      expected = b64UrlDecodeBytes(signData(data, candidate));
+    } catch {
+      continue;
+    }
+    if (presented.length === expected.length && timingSafeEqual(presented, expected)) {
+      signatureOk = true;
+      break;
+    }
+  }
+  if (!signatureOk) throw new UserTokenError("bad signature");
+  if (typeof payload !== "object" || payload === null) throw new UserTokenError("malformed payload");
+  const p = payload as Record<string, unknown>;
+  if (typeof p["sub"] !== "string" || p["sub"] === "" || (p["sub"] as string).length > 256) {
+    throw new UserTokenError("malformed payload");
+  }
+  if (p["iss"] !== expectedIss) throw new UserTokenError("malformed payload");
+  if (p["aud"] !== USER_TOKEN_AUDIENCE) throw new UserTokenError("malformed payload");
+  if (p["intent"] !== USER_TOKEN_INTENT) throw new UserTokenError("malformed payload");
+  if (typeof p["exp"] !== "number" || !Number.isFinite(p["exp"])) throw new UserTokenError("malformed payload");
+  if (typeof p["iat"] !== "number" || !Number.isFinite(p["iat"])) throw new UserTokenError("malformed payload");
+  if (!isValidUserTokenScopeSet(p["scope"])) throw new UserTokenError("malformed payload");
+  if (typeof p["jti"] !== "string" || p["jti"] === "") throw new UserTokenError("malformed payload");
+  if ((p["exp"] as number) <= Math.floor(Date.now() / 1000)) throw new UserTokenError("expired");
+  return {
+    sub: p["sub"] as string,
+    scope: [...(p["scope"] as string[])],
+    jti: p["jti"] as string,
+    iss: p["iss"] as string,
+    aud: USER_TOKEN_AUDIENCE,
+    exp: p["exp"] as number,
+    iat: p["iat"] as number,
+    intent: USER_TOKEN_INTENT,
+  };
 }

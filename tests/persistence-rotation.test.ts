@@ -127,6 +127,7 @@ describe("identity-only boundary", () => {
       [
         "consumed_purpose_tokens",
         "google_states",
+        "ide_refresh_tokens",
         "oidc_codes",
         "product_exchange_codes",
         "product_exchange_redirects",

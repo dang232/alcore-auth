@@ -13,14 +13,20 @@ import {
   verifyPassword,
   randomToken,
   hashToken,
+  hashEqual,
   signAccess,
   verifyAccess,
+  signUserToken,
+  isValidUserTokenScopeSet,
+  USER_TOKEN_TTL_SECONDS,
+  USER_TOKEN_SCOPES,
+  type UserTokenScope,
   mintPurposeToken,
   verifyPurposeToken,
   JwtError,
   TokenError,
 } from "../lib/crypto";
-import { googleStateStore, markPurposeConsumed, productExchangeStore, userStore, sessionStore } from "../lib/store";
+import { googleStateStore, markPurposeConsumed, productExchangeStore, userStore, sessionStore, ideRefreshStore } from "../lib/store";
 import { verifyPasswordCompat } from "../lib/legacy-password";
 import { emitAudit } from "../lib/audit";
 import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential, type VerifiedGoogleProfile } from "../lib/google";
@@ -31,6 +37,12 @@ import { issueSignupOtp, sendSignupOtp, verifySignupOtp } from "../lib/otp";
 
 export const ACCESS_TTL_SECONDS = 900; // short-lived access (15 min)
 export const REFRESH_TTL_MS = 30 * 24 * 3600 * 1000; // rotating refresh (30 d)
+// User-scoped IDE tokens (project-ide task 38): 10-min access + ~30 d
+// rotating opaque refresh. Desktop Google-login completion mints the full
+// desktop scope set; rotation re-mints the family's stored scopes.
+export const IDE_ACCESS_TTL_SECONDS = USER_TOKEN_TTL_SECONDS;
+export const IDE_REFRESH_TTL_MS = 30 * 24 * 3600 * 1000;
+export const IDE_DESKTOP_SCOPES: readonly UserTokenScope[] = USER_TOKEN_SCOPES;
 const VERIFY_TTL_SECONDS = 24 * 3600;
 const RESET_TTL_SECONDS = 3600;
 
@@ -327,6 +339,40 @@ async function issuePair(userId: string): Promise<{ pair: TokenPair; session: Se
   };
 }
 
+export interface UserTokenPair {
+  access_token: string;
+  refresh_token: string;
+  token_type: "Bearer";
+  expires_in: number;
+  scope: UserTokenScope[];
+}
+
+/**
+ * Mint a user-scoped IDE pair: 10-min access JWT (sub + scope + jti, kid-bound
+ * to the current rotation key) + opaque single-use refresh stored hashed in
+ * its own family. The refresh is NEVER a session refresh: the two families
+ * live in different tables, so neither refresh endpoint accepts the other's
+ * tokens (both collapse to 401).
+ */
+async function issueUserTokenPair(userId: string, scopes: readonly UserTokenScope[]): Promise<UserTokenPair> {
+  const keys = getJwtRotationKeys();
+  const refresh = randomToken(32);
+  await ideRefreshStore.issue(userId, hashToken(refresh), scopes, IDE_REFRESH_TTL_MS);
+  const access = signUserToken(
+    { sub: userId, scope: scopes, iss: getIssuer() },
+    keys.current,
+    IDE_ACCESS_TTL_SECONDS,
+    { kid: keys.currentKid },
+  );
+  return {
+    access_token: access,
+    refresh_token: refresh,
+    token_type: "Bearer",
+    expires_in: IDE_ACCESS_TTL_SECONDS,
+    scope: [...scopes],
+  };
+}
+
 function setAuthCookies(c: Context, pair: TokenPair): void {
   const base = { httpOnly: true, secure: true, sameSite: "Strict" as const, path: "/" };
   setCookie(c, "alcore_at", pair.access_token, { ...base, maxAge: ACCESS_TTL_SECONDS });
@@ -488,6 +534,63 @@ authRoutes.post("/refresh", async (c) => {
     emitAudit("auth.refresh_reuse", "invalid_grant", { userId: reuse.userId, ip: clientIp(c) });
   } else {
     emitAudit("auth.refresh", "invalid_grant", { ip: clientIp(c) });
+  }
+  return c.json({ error: "invalid_grant" }, 401);
+});
+
+// POST /auth/token/refresh — user-scoped IDE pair rotation (project-ide
+// task 38). Body { refreshToken }: single-use opaque refresh, stored hashed
+// with ~30 d expiry; rotation mints a fresh pair with the family's scopes and
+// reuse of a rotated-out token revokes the whole family (theft signal).
+// Every failure — missing/malformed/unknown/expired/reused — answers the
+// identical 401 { error: "invalid_grant" } (never 500, no oracle). Session
+// refresh tokens live in a different table and never validate here.
+authRoutes.post("/token/refresh", async (c) => {
+  const gateUserRefresh = await limitedAsync(c, "refresh");
+  if (gateUserRefresh !== null) return gateUserRefresh;
+  const body = await readJson(c);
+  const presented = str(body?.["refreshToken"]);
+  if (presented === "" || presented.length > 512) {
+    emitAudit("auth.user_token_refresh", "invalid_grant", { ip: clientIp(c) });
+    return c.json({ error: "invalid_grant" }, 401);
+  }
+  const digest = hashToken(presented);
+  const record = await ideRefreshStore.findByTokenHash(digest);
+  if (
+    record !== undefined &&
+    !record.revoked &&
+    record.expiresAt > Date.now() &&
+    hashEqual(digest, record.tokenHash) &&
+    isValidUserTokenScopeSet(record.scopes)
+  ) {
+    const next = randomToken(32);
+    if (await ideRefreshStore.rotate(record, hashToken(next))) {
+      const keys = getJwtRotationKeys();
+      const access = signUserToken(
+        { sub: record.userId, scope: record.scopes, iss: getIssuer() },
+        keys.current,
+        IDE_ACCESS_TTL_SECONDS,
+        { kid: keys.currentKid },
+      );
+      const rotated: UserTokenPair = {
+        access_token: access,
+        refresh_token: next,
+        token_type: "Bearer",
+        expires_in: IDE_ACCESS_TTL_SECONDS,
+        scope: [...record.scopes],
+      };
+      emitAudit("auth.user_token_refresh", "ok", { userId: record.userId, ip: clientIp(c) });
+      return c.json(rotated);
+    }
+  }
+  // Lost the rotation race, or presented an already-rotated token: either
+  // way the digest is now a reuse signal — revoke the whole family.
+  const reuse = await ideRefreshStore.findByTokenOrPrevHash(digest);
+  if (reuse !== undefined && ideRefreshStore.isReusedHash(reuse, digest)) {
+    await ideRefreshStore.revokeFamily(reuse.familyId);
+    emitAudit("auth.user_token_refresh_reuse", "invalid_grant", { userId: reuse.userId, ip: clientIp(c) });
+  } else {
+    emitAudit("auth.user_token_refresh", "invalid_grant", { ip: clientIp(c) });
   }
   return c.json({ error: "invalid_grant" }, 401);
 });
@@ -965,8 +1068,11 @@ authRoutes.post("/google/desktop-code", async (c) => {
   }
   const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
+  // User-scoped IDE pair for the desktop client (OS-keychain storage): the
+  // full desktop scope set. Session cookies/URIs/OTP flows above untouched.
+  const userToken = await issueUserTokenPair(user.id, IDE_DESKTOP_SCOPES);
   emitAudit("auth.oauth_callback", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ access_token: pair.access_token, ...googleCompletionProfile(profile) });
+  return c.json({ access_token: pair.access_token, user_token: userToken, ...googleCompletionProfile(profile) });
 });
 
 // Google → product handoff (e.g. Libre full-page Google login chaining back).

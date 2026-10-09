@@ -20,9 +20,11 @@
 
 import { createHash } from "node:crypto";
 import { SQL } from "bun";
-import { verifyPkceS256 } from "./crypto";
+import { hashEqual, verifyPkceS256 } from "./crypto";
 import type {
   GoogleStateStore,
+  IdeRefreshRecord,
+  IdeRefreshStore,
   IdentityLinkResult,
   OidcCode,
   OidcStore,
@@ -137,6 +139,7 @@ function randomHex(bytes: number): string {
 export interface PgStores {
   readonly userStore: UserStore;
   readonly sessionStore: SessionStore;
+  readonly ideRefreshStore: IdeRefreshStore;
   readonly oidcStore: OidcStore;
   readonly productExchangeStore: ProductExchangeStore;
   readonly googleStateStore: GoogleStateStore;
@@ -301,6 +304,27 @@ export function createPgStores(conn: PgConn): PgStores {
     },
   };
 
+function ideRefreshFromRow(row: PgRow | undefined): IdeRefreshRecord | undefined {
+  if (row === undefined) return undefined;
+  let scopes: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(String(row["scopes"]));
+    if (Array.isArray(parsed)) scopes = parsed.filter((s): s is string => typeof s === "string");
+  } catch {
+    scopes = [];
+  }
+  return {
+    familyId: String(row["family_id"]),
+    userId: String(row["user_id"]),
+    tokenHash: String(row["token_hash"]),
+    prevHashes: new Set(JSON.parse(String(row["previous_hashes"])) as string[]),
+    scopes,
+    createdAt: Number(row["created_at"]),
+    expiresAt: Number(row["expires_at"]),
+    revoked: Number(row["revoked"]) === 1,
+  };
+}
+
   const oidcStore: OidcStore = {
     async issue(userId, redirectUri, clientId, ttlSeconds, pkce): Promise<OidcCode> {
       const record: OidcCode = {
@@ -339,6 +363,68 @@ export function createPgStores(conn: PgConn): PgStores {
         codeChallenge: String(row["code_challenge"] ?? ""),
         codeChallengeMethod: String(row["code_challenge_method"] ?? ""),
       };
+    },
+  };
+
+  const ideRefreshStore: IdeRefreshStore = {
+    async issue(userId, tokenHash, scopes, ttlMs): Promise<IdeRefreshRecord> {
+      const now = Date.now();
+      const record: IdeRefreshRecord = {
+        familyId: crypto.randomUUID(),
+        userId,
+        tokenHash,
+        prevHashes: new Set<string>(),
+        scopes: [...scopes],
+        createdAt: now,
+        expiresAt: now + ttlMs,
+        revoked: false,
+      };
+      await conn.query(
+        "INSERT INTO ide_refresh_tokens (family_id,user_id,token_hash,previous_hashes,scopes,created_at,expires_at,revoked) VALUES ($1,$2,$3,$4,$5,$6,$7,0)",
+        [record.familyId, record.userId, record.tokenHash, "[]", JSON.stringify(record.scopes), record.createdAt, record.expiresAt],
+      );
+      return record;
+    },
+    async findByTokenHash(hash): Promise<IdeRefreshRecord | undefined> {
+      const rows = await conn.query<PgRow>("SELECT * FROM ide_refresh_tokens WHERE token_hash=$1", [hash]);
+      return ideRefreshFromRow(rows[0]);
+    },
+    async findByTokenOrPrevHash(hash): Promise<IdeRefreshRecord | undefined> {
+      const live = await conn.query<PgRow>("SELECT * FROM ide_refresh_tokens WHERE token_hash=$1", [hash]);
+      if (live[0] !== undefined) return ideRefreshFromRow(live[0]);
+      const prev = await conn.query<PgRow>("SELECT * FROM ide_refresh_tokens WHERE previous_hashes LIKE $1", [`%${hash}%`]);
+      for (const row of prev) {
+        const record = ideRefreshFromRow(row);
+        if (record !== undefined) {
+          let hit = false;
+          for (const candidate of record.prevHashes) {
+            if (hashEqual(candidate, hash)) hit = true;
+          }
+          if (hit) return record;
+        }
+      }
+      return undefined;
+    },
+    async rotate(record, nextHash): Promise<boolean> {
+      const merged = [...record.prevHashes, record.tokenHash];
+      const rows = await conn.query<PgRow>(
+        "UPDATE ide_refresh_tokens SET token_hash=$1,previous_hashes=$2 WHERE family_id=$3 AND token_hash=$4 AND revoked=0 RETURNING family_id",
+        [nextHash, JSON.stringify(merged), record.familyId, record.tokenHash],
+      );
+      if (rows.length === 0) return false;
+      record.prevHashes.add(record.tokenHash);
+      record.tokenHash = nextHash;
+      return true;
+    },
+    isReusedHash(record, hash): boolean {
+      let hit = false;
+      for (const prev of record.prevHashes) {
+        if (hashEqual(prev, hash)) hit = true;
+      }
+      return hit;
+    },
+    async revokeFamily(familyId): Promise<void> {
+      await conn.query("UPDATE ide_refresh_tokens SET revoked=1 WHERE family_id=$1", [familyId]);
     },
   };
 
@@ -443,6 +529,7 @@ export function createPgStores(conn: PgConn): PgStores {
   };
 
   async function resetStoresForTests(): Promise<void> {
+    await conn.query("DELETE FROM ide_refresh_tokens");
     await conn.query("DELETE FROM provisioning_ledger");
     await conn.query("DELETE FROM consumed_purpose_tokens");
     await conn.query("DELETE FROM product_exchange_redirects");
@@ -454,5 +541,5 @@ export function createPgStores(conn: PgConn): PgStores {
     await conn.query("DELETE FROM users");
   }
 
-  return { userStore, sessionStore, oidcStore, productExchangeStore, googleStateStore, purposeLedger, resetStoresForTests };
+  return { userStore, sessionStore, ideRefreshStore, oidcStore, productExchangeStore, googleStateStore, purposeLedger, resetStoresForTests };
 }

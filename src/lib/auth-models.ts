@@ -33,6 +33,24 @@ export interface Session {
   revoked: boolean;
 }
 
+/**
+ * User-scoped IDE refresh family (project-ide task 38). One row per login
+ * chain: the live opaque refresh digest plus every rotated-out digest.
+ * A presented digest found in prevHashes is a reuse (theft signal) and the
+ * caller revokes the whole family. Scopes ride the family so rotation
+ * re-mints the same least-privilege set without trusting the client.
+ */
+export interface IdeRefreshRecord {
+  readonly familyId: string;
+  readonly userId: string;
+  tokenHash: string;
+  prevHashes: Set<string>;
+  readonly scopes: string[];
+  readonly createdAt: number;
+  readonly expiresAt: number;
+  revoked: boolean;
+}
+
 export interface OidcCode {
   readonly code: string;
   readonly userId: string;
@@ -88,6 +106,22 @@ export interface SessionStore {
   revokeAllForUser(userId: string): Promise<void>;
   listActiveForUser(userId: string): Promise<Session[]>;
   revokeByIdForUser(id: string, userId: string): Promise<boolean>;
+}
+
+export interface IdeRefreshStore {
+  issue(userId: string, tokenHash: string, scopes: readonly string[], ttlMs: number): Promise<IdeRefreshRecord>;
+  findByTokenHash(hash: string): Promise<IdeRefreshRecord | undefined>;
+  findByTokenOrPrevHash(hash: string): Promise<IdeRefreshRecord | undefined>;
+  /**
+   * Atomic compare-and-swap rotation: wins only when the family row still
+   * holds the presented hash and is not revoked. Returns true on win; on
+   * loss the in-memory record is left untouched.
+   */
+  rotate(record: IdeRefreshRecord, nextHash: string): Promise<boolean>;
+  /** Constant-time reuse check: true when the digest matches a rotated-out hash. */
+  isReusedHash(record: IdeRefreshRecord, hash: string): boolean;
+  /** Revoke the whole chain (theft response to reuse). */
+  revokeFamily(familyId: string): Promise<void>;
 }
 
 export interface OidcStore {
