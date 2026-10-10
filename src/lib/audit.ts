@@ -16,6 +16,8 @@ export type AuditEvent =
   | "auth.login_failed"
   | "auth.refresh"
   | "auth.refresh_reuse"
+  | "auth.user_token_refresh"
+  | "auth.user_token_refresh_reuse"
   | "auth.logout"
   | "auth.session_read"
   | "auth.session_list"
