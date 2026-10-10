@@ -52,6 +52,10 @@ describe("signup OTP", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.to).toBe("happy@example.com");
     expect(sent[0]?.text).toContain(code);
+    // Signup mail carries the code for typing, never a reset template link.
+    expect(sent[0]?.subject).toContain("verification code");
+    expect(sent[0]?.text).not.toContain("password");
+    expect(sent[0]?.text).not.toContain("/consume");
 
     expect(await verifySignupOtp("user-happy", code)).toBe(true);
   });

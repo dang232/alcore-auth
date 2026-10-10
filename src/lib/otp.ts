@@ -236,11 +236,7 @@ export async function verifySignupOtp(userId: string, code: string): Promise<boo
  * "signup-otp"). The transport is swapped in tests via setMailSender.
  */
 export async function sendSignupOtp(email: string, code: string): Promise<MailOutcome> {
-  // deliverPurposeMail's purpose union only names the route-owned purposes;
-  // mail.ts is out of scope here, so the new purpose passes through at
-  // runtime (the cast is compile-time only) and lands in the message body.
-  const purpose = "signup-otp" as unknown as "verify";
-  return deliverPurposeMail(purpose, email, code);
+  return deliverPurposeMail("signup-otp", email, code);
 }
 
 /**

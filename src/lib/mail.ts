@@ -30,6 +30,9 @@ export type MailSender = (message: MailMessage) => Promise<MailOutcome>;
 /**
  * Purpose-token links are minted by the routes and delivered here. The token is
  * the only bearer of authority in the message, so the URL is the payload.
+ *
+ * The signup OTP is the exception: the 6-digit code is typed into the app,
+ * never clicked, so its message carries the code in the body with no link.
  */
 export function purposeLink(
   purpose: "verify" | "reset",
@@ -39,10 +42,23 @@ export function purposeLink(
 }
 
 function buildMessage(
-  purpose: "verify" | "reset",
+  purpose: "verify" | "reset" | "signup-otp",
   email: string,
   token: string
 ): MailMessage {
+  if (purpose === "signup-otp") {
+    return {
+      to: email,
+      subject: "Your Alcore verification code",
+      text: [
+        "Use this code to finish setting up your account (expires in 10 minutes):",
+        "",
+        token,
+        "",
+        "If you did not request this, you can ignore this message.",
+      ].join("\n"),
+    };
+  }
   const link = purposeLink(purpose, token);
   if (purpose === "verify") {
     return {
@@ -138,7 +154,7 @@ export function resetMailSender(): void {
  * into a 500 that reveals whether the address was real.
  */
 export async function deliverPurposeMail(
-  purpose: "verify" | "reset",
+  purpose: "verify" | "reset" | "signup-otp",
   email: string,
   token: string
 ): Promise<MailOutcome> {
