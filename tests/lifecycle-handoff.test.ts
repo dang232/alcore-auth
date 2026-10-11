@@ -147,12 +147,21 @@ describe("registration lifecycle", () => {
     const pending = await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" });
     expect(pending.status).toBe(202);
     expect(await pending.json()).toEqual({ pending: true, otpRequired: true, email: "lh-reg2@example.com" });
+    // Unverified re-register resends the code and stays pending (no 409 dead end).
+    const resent = await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" });
+    expect(resent.status).toBe(202);
+    expect(await resent.json()).toEqual({ pending: true, otpRequired: true, email: "lh-reg2@example.com" });
+    // Once verified, the same email is taken for real.
+    const regCode = mailedCode(sent.find((m) => m.to === "lh-reg2@example.com") as MailMessage);
+    expect(regCode).toMatch(/^\d{6}$/);
+    expect((await post("/auth/verify-otp", { email: "lh-reg2@example.com", code: regCode })).status).toBe(200);
     const taken = await post("/auth/register", { email: "lh-reg2@example.com", password: "s3cret-pass" });
     expect(taken.status).toBe(409);
     expect(await taken.json()).toEqual({ error: "email_taken" });
     const outcomes = auditEvents().filter((r) => r.event === "auth.register").map((r) => r.outcome);
     expect(outcomes).toContain("invalid_email");
     expect(outcomes).toContain("weak_password");
+    expect(outcomes).toContain("resent");
     expect(outcomes).toContain("email_taken");
     expect(outcomes).toContain("ok");
   });

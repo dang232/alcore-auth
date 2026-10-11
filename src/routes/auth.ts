@@ -423,7 +423,27 @@ authRoutes.post("/register", async (c) => {
     emitAudit("auth.register", "weak_password", { ip: clientIp(c) });
     return c.json({ error: "weak_password" }, 400);
   }
-  if ((await userStore.findByEmail(email)) !== undefined) {
+  const pendingUser = await userStore.findByEmail(email);
+  if (pendingUser !== undefined && !pendingUser.emailVerified) {
+    // Idempotent re-register: the account exists but never verified, so the
+    // visitor most likely lost the first code. Re-issue (resend cooldown
+    // still applies) and answer pending again instead of a 409 dead end.
+    try {
+      const code = await issueSignupOtp(pendingUser.id, pendingUser.email);
+      await sendSignupOtp(pendingUser.email, code);
+    } catch {
+      // Cooldown window: keep the pending answer; the earlier code stays valid.
+    }
+    emitAudit("auth.register", "resent", {
+      userId: pendingUser.id,
+      ip: clientIp(c),
+    });
+    return c.json(
+      { pending: true, otpRequired: true, email: pendingUser.email },
+      202
+    );
+  }
+  if (pendingUser !== undefined) {
     // Intentional 409 (client needs the outcome to finish signup); login and
     // verify/reset-request surfaces stay non-enumerating (always-401 / always-200).
     emitAudit("auth.register", "email_taken", { ip: clientIp(c) });
