@@ -21,6 +21,62 @@ export interface MailMessage {
   readonly to: string;
   readonly subject: string;
   readonly text: string;
+  /** Optional HTML twin of `text` (inline styles, table-based for mail
+   * clients). Transports send both; `text` stays the deliverability-safe
+   * fallback and the assertion surface for tests. */
+  readonly html?: string | undefined;
+}
+
+// Brand signature shared by every outbound message (OTP + verify + reset):
+// short, no marketing — transactional mail with promo copy earns complaints
+// and loses its protected reputation.
+const BRAND_NAME = "ALCORE";
+const BRAND_SITE_URL = "https://alcore.io.vn";
+const BRAND_SUPPORT_URL = "https://alcore.io.vn/support";
+
+function signatureTextLines(): string[] {
+  return [
+    "—",
+    `Đội ngũ ${BRAND_NAME}`,
+    `${BRAND_SITE_URL} · Hỗ trợ: ${BRAND_SUPPORT_URL}`,
+  ];
+}
+
+function escHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Table-based HTML shell (renders everywhere, inline styles only). */
+function brandHtmlShell(codeOrBody: string, footerNote: string): string {
+  return [
+    '<!DOCTYPE html><html lang="vi"><body style="margin:0;padding:0;background:#f4f5f7;font-family:Arial,Helvetica,sans-serif;">',
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;"><tr><td align="center">',
+    '<table role="presentation" width="420" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;padding:32px;">',
+    `<tr><td style="font-size:18px;font-weight:bold;color:#111;padding-bottom:8px;">${escHtml(BRAND_NAME)}</td></tr>`,
+    codeOrBody,
+    `<tr><td style="font-size:12px;color:#888;line-height:1.5;">${footerNote}</td></tr>`,
+    "</table>",
+    '<table role="presentation" width="420" cellpadding="0" cellspacing="0">',
+    `<tr><td style="font-size:11px;color:#999;padding:16px 8px;text-align:center;">Đội ngũ ${escHtml(BRAND_NAME)} &middot; <a href="${BRAND_SITE_URL}" style="color:#999;">${escHtml(BRAND_SITE_URL)}</a> &middot; <a href="${BRAND_SUPPORT_URL}" style="color:#999;">Hỗ trợ</a></td></tr>`,
+    "</table>",
+    "</td></tr></table></body></html>",
+  ].join("");
+}
+
+function otpHtml(code: string): string {
+  return brandHtmlShell(
+    [
+      '<tr><td style="font-size:14px;color:#444;line-height:1.5;padding-bottom:20px;">Mã xác thực của bạn (hết hạn sau 10 phút):</td></tr>',
+      '<tr><td align="center" style="padding-bottom:20px;">',
+      `<div style="font-size:32px;letter-spacing:8px;font-weight:bold;color:#111;background:#f4f5f7;border-radius:6px;padding:14px 24px;display:inline-block;font-family:monospace;">${escHtml(code)}</div>`,
+      "</td></tr>",
+    ].join(""),
+    "Nếu bạn không yêu cầu mã này, hãy bỏ qua email này."
+  );
 }
 
 export type MailOutcome = "delivered" | "not_configured" | "failed";
@@ -47,16 +103,24 @@ function buildMessage(
   token: string
 ): MailMessage {
   if (purpose === "signup-otp") {
+    // Scannable in 2-3 seconds: greeting, code on its own line, honest
+    // expiry, ignore line, brand signature. Vietnamese-first to match the
+    // portal's code-entry screens.
     return {
       to: email,
-      subject: "Your Alcore verification code",
+      subject: `Mã xác thực ${BRAND_NAME} của bạn`,
       text: [
-        "Use this code to finish setting up your account (expires in 10 minutes):",
+        "Chào bạn,",
+        "",
+        "Mã xác thực của bạn (hết hạn sau 10 phút):",
         "",
         token,
         "",
-        "If you did not request this, you can ignore this message.",
+        "Nhập mã này vào trang đăng ký/đăng nhập để hoàn tất.",
+        "Nếu bạn không yêu cầu mã này, hãy bỏ qua email này.",
+        ...signatureTextLines(),
       ].join("\n"),
+      html: otpHtml(token),
     };
   }
   const link = purposeLink(purpose, token);
@@ -70,6 +134,7 @@ function buildMessage(
         link,
         "",
         "If you did not request this, you can ignore this message.",
+        ...signatureTextLines(),
       ].join("\n"),
     };
   }
@@ -82,6 +147,7 @@ function buildMessage(
       link,
       "",
       "If you did not request this, nothing changed and you can ignore this message.",
+      ...signatureTextLines(),
     ].join("\n"),
   };
 }
@@ -122,6 +188,7 @@ export const smtpSender: MailSender = async (message) => {
       to: message.to,
       subject: message.subject,
       text: message.text,
+      ...(message.html !== undefined ? { html: message.html } : {}),
     });
     // Log success too. Silence on the happy path made "did it send?" unanswerable
     // from the journal: only failures were recorded, so an operator could not

@@ -143,6 +143,32 @@ describe("deliverPurposeMail", () => {
     expect(sent[0]?.text).toContain("reset/consume?token=reset-tok");
   });
 
+  test("every message carries the brand signature, never marketing copy", async () => {
+    capturingSender();
+    for (const purpose of ["verify", "reset", "signup-otp"] as const) {
+      await deliverPurposeMail(purpose, "user@example.com", "tok-1");
+    }
+    expect(sent).toHaveLength(3);
+    for (const message of sent) {
+      expect(message?.text).toContain("ALCORE");
+      expect(message?.text).toContain("https://alcore.io.vn/support");
+    }
+  });
+
+  test("signup OTP puts the code on its own line with honest expiry", async () => {
+    capturingSender();
+    await deliverPurposeMail("signup-otp", "user@example.com", "482913");
+    expect(sent).toHaveLength(1);
+    const message = sent[0];
+    expect(message?.subject).toContain("ALCORE");
+    expect(message?.text).toContain("10 phút");
+    // Scannable: the code stands alone on one line.
+    expect(message?.text.split("\n")).toContain("482913");
+    // HTML twin carries the same code in a high-contrast box.
+    expect(message?.html).toContain("482913");
+    expect(message?.html).toContain("letter-spacing:8px");
+  });
+
   test("a throwing sender is contained and never escapes to the caller", async () => {
     setMailSender(async () => {
       throw new Error("smtp exploded");
