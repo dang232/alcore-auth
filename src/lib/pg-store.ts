@@ -109,6 +109,7 @@ function sessionFromRow(row: PgRow | undefined): Session | undefined {
     createdAt: Number(row["created_at"]),
     expiresAt: Number(row["expires_at"]),
     revoked: Number(row["revoked"]) === 1,
+    rotatedAt: Number(row["rotated_at"] ?? 0),
   };
 }
 
@@ -267,13 +268,15 @@ export function createPgStores(conn: PgConn): PgStores {
     },
     async rotate(session, nextHash): Promise<boolean> {
       const merged = [...session.prevHashes, session.refreshHash];
+      const rotatedAt = Date.now();
       const rows = await conn.query<PgRow>(
-        "UPDATE sessions SET refresh_hash=$1,previous_hashes=$2 WHERE id=$3 AND refresh_hash=$4 AND revoked=0 RETURNING id",
-        [nextHash, JSON.stringify(merged), session.id, session.refreshHash],
+        "UPDATE sessions SET refresh_hash=$1,previous_hashes=$2,rotated_at=$3 WHERE id=$4 AND refresh_hash=$5 AND revoked=0 RETURNING id",
+        [nextHash, JSON.stringify(merged), rotatedAt, session.id, session.refreshHash],
       );
       if (rows.length === 0) return false;
       session.prevHashes.add(session.refreshHash);
       session.refreshHash = nextHash;
+      session.rotatedAt = rotatedAt;
       return true;
     },
     isReusedHash(session, hash): boolean {
@@ -322,6 +325,7 @@ function ideRefreshFromRow(row: PgRow | undefined): IdeRefreshRecord | undefined
     createdAt: Number(row["created_at"]),
     expiresAt: Number(row["expires_at"]),
     revoked: Number(row["revoked"]) === 1,
+    rotatedAt: Number(row["rotated_at"] ?? 0),
   };
 }
 
@@ -407,13 +411,15 @@ function ideRefreshFromRow(row: PgRow | undefined): IdeRefreshRecord | undefined
     },
     async rotate(record, nextHash): Promise<boolean> {
       const merged = [...record.prevHashes, record.tokenHash];
+      const rotatedAt = Date.now();
       const rows = await conn.query<PgRow>(
-        "UPDATE ide_refresh_tokens SET token_hash=$1,previous_hashes=$2 WHERE family_id=$3 AND token_hash=$4 AND revoked=0 RETURNING family_id",
-        [nextHash, JSON.stringify(merged), record.familyId, record.tokenHash],
+        "UPDATE ide_refresh_tokens SET token_hash=$1,previous_hashes=$2,rotated_at=$3 WHERE family_id=$4 AND token_hash=$5 AND revoked=0 RETURNING family_id",
+        [nextHash, JSON.stringify(merged), rotatedAt, record.familyId, record.tokenHash],
       );
       if (rows.length === 0) return false;
       record.prevHashes.add(record.tokenHash);
       record.tokenHash = nextHash;
+      record.rotatedAt = rotatedAt;
       return true;
     },
     isReusedHash(record, hash): boolean {

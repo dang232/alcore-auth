@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   previous_hashes TEXT NOT NULL DEFAULT '[]',
   created_at BIGINT NOT NULL,
   expires_at BIGINT NOT NULL,
-  revoked SMALLINT NOT NULL DEFAULT 0
+  revoked SMALLINT NOT NULL DEFAULT 0,
+  rotated_at BIGINT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
 
@@ -102,7 +103,8 @@ CREATE TABLE IF NOT EXISTS ide_refresh_tokens (
   scopes TEXT NOT NULL DEFAULT '[]',
   created_at BIGINT NOT NULL,
   expires_at BIGINT NOT NULL,
-  revoked SMALLINT NOT NULL DEFAULT 0
+  revoked SMALLINT NOT NULL DEFAULT 0,
+  rotated_at BIGINT NOT NULL DEFAULT 0
 );
 
 -- DOWN (retire-only; never run against a live backend — cutover rollback is

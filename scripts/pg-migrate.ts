@@ -10,6 +10,7 @@ import { connectPg } from "./lib/connect";
 const VERSIONS = [
   { version: "001", file: "pg-schema.sql" },
   { version: "002", file: "pg-schema-002-provisioning-ledger.sql" },
+  { version: "003", file: "pg-schema-003-refresh-rotation.sql" },
 ] as const;
 
 /**

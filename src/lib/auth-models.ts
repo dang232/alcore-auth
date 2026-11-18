@@ -31,6 +31,12 @@ export interface Session {
   readonly createdAt: number;
   readonly expiresAt: number;
   revoked: boolean;
+  /**
+   * When the live refresh hash was last rotated out (ms). 0 means the session
+   * was issued and never rotated, and a row written before the column existed.
+   * The reuse grace window reads it to tell a client race from theft.
+   */
+  rotatedAt?: number;
 }
 
 /**
@@ -49,6 +55,8 @@ export interface IdeRefreshRecord {
   readonly createdAt: number;
   readonly expiresAt: number;
   revoked: boolean;
+  /** When the live refresh hash was last rotated out (ms); 0 = never rotated. */
+  rotatedAt?: number;
 }
 
 export interface OidcCode {

@@ -84,7 +84,8 @@ db.run(`
     previous_hashes TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0
+    revoked INTEGER NOT NULL DEFAULT 0,
+    rotated_at INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS oidc_codes (
     code TEXT PRIMARY KEY,
@@ -140,7 +141,8 @@ db.run(`
     scopes TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
-    revoked INTEGER NOT NULL DEFAULT 0
+    revoked INTEGER NOT NULL DEFAULT 0,
+    rotated_at INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
 `);
@@ -157,6 +159,13 @@ if (!db.query("PRAGMA table_info(oidc_codes)").all().some((column) => {
 for (const pkceColumn of ["code_challenge", "code_challenge_method"] as const) {
   const present = (db.query("PRAGMA table_info(oidc_codes)").all() as Row[]).some((column) => column["name"] === pkceColumn);
   if (!present) db.run(`ALTER TABLE oidc_codes ADD COLUMN ${pkceColumn} TEXT NOT NULL DEFAULT ''`);
+}
+// Rotation timestamps for pre-existing file DBs: the reuse grace window needs
+// to know WHEN the presented token was rotated out. 0 on a migrated row means
+// "no recorded rotation", which keeps the old revoke-on-reuse policy.
+for (const table of ["sessions", "ide_refresh_tokens"] as const) {
+  const present = (db.query(`PRAGMA table_info(${table})`).all() as Row[]).some((column) => column["name"] === "rotated_at");
+  if (!present) db.run(`ALTER TABLE ${table} ADD COLUMN rotated_at INTEGER NOT NULL DEFAULT 0`);
 }
 
 function userFromRow(row: Row | null): User | undefined {
@@ -180,6 +189,7 @@ function sessionFromRow(row: Row | null): Session | undefined {
     createdAt: Number(row["created_at"]),
     expiresAt: Number(row["expires_at"]),
     revoked: Number(row["revoked"]) === 1,
+    rotatedAt: Number(row["rotated_at"] ?? 0),
   };
 }
 
@@ -289,12 +299,14 @@ const sqliteSessionStore = {
    */
   rotate(session: Session, nextHash: string): boolean {
     const merged = [...session.prevHashes, session.refreshHash];
+    const rotatedAt = Date.now();
     const row = db.query(
-      "UPDATE sessions SET refresh_hash=?,previous_hashes=? WHERE id=? AND refresh_hash=? AND revoked=0 RETURNING id",
-    ).get(nextHash, JSON.stringify(merged), session.id, session.refreshHash) as Row | null;
+      "UPDATE sessions SET refresh_hash=?,previous_hashes=?,rotated_at=? WHERE id=? AND refresh_hash=? AND revoked=0 RETURNING id",
+    ).get(nextHash, JSON.stringify(merged), rotatedAt, session.id, session.refreshHash) as Row | null;
     if (row === null) return false;
     session.prevHashes.add(session.refreshHash);
     session.refreshHash = nextHash;
+    session.rotatedAt = rotatedAt;
     return true;
   },
   isReusedHash(session: Session, hash: string): boolean {
@@ -336,6 +348,7 @@ function ideRefreshFromRow(row: Row | null): IdeRefreshRecord | undefined {
     createdAt: Number(row["created_at"]),
     expiresAt: Number(row["expires_at"]),
     revoked: Number(row["revoked"]) === 1,
+    rotatedAt: Number(row["rotated_at"] ?? 0),
   };
 }
 
@@ -383,12 +396,14 @@ const sqliteIdeRefreshStore = {
    */
   rotate(record: IdeRefreshRecord, nextHash: string): boolean {
     const merged = [...record.prevHashes, record.tokenHash];
+    const rotatedAt = Date.now();
     const row = db.query(
-      "UPDATE ide_refresh_tokens SET token_hash=?,previous_hashes=? WHERE family_id=? AND token_hash=? AND revoked=0 RETURNING family_id",
-    ).get(nextHash, JSON.stringify(merged), record.familyId, record.tokenHash) as Row | null;
+      "UPDATE ide_refresh_tokens SET token_hash=?,previous_hashes=?,rotated_at=? WHERE family_id=? AND token_hash=? AND revoked=0 RETURNING family_id",
+    ).get(nextHash, JSON.stringify(merged), rotatedAt, record.familyId, record.tokenHash) as Row | null;
     if (row === null) return false;
     record.prevHashes.add(record.tokenHash);
     record.tokenHash = nextHash;
+    record.rotatedAt = rotatedAt;
     return true;
   },
   isReusedHash(record: IdeRefreshRecord, hash: string): boolean {
