@@ -6,50 +6,13 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { connectPg } from "./lib/connect";
+import { splitStatements } from "./lib/split-statements";
 
 const VERSIONS = [
   { version: "001", file: "pg-schema.sql" },
   { version: "002", file: "pg-schema-002-provisioning-ledger.sql" },
   { version: "003", file: "pg-schema-003-refresh-rotation.sql" },
 ] as const;
-
-/**
- * Split a migration script into statements. Aware of dollar-quoted function
- * bodies (002 trigger guard): semicolons inside $$...$$ never split, and
- * the CREATE TRIGGER lines after the body split normally. Line comments
- * (-- ...) are stripped only outside dollar-quoted blocks.
- */
-function splitStatements(raw: string): string[] {
-  const withoutComments: string[] = [];
-  let inDollar = false;
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trimStart();
-    if (!inDollar && trimmed.startsWith("--")) continue;
-    const opens = (line.match(/\$\$/g) ?? []).length;
-    if (opens % 2 === 1) inDollar = !inDollar;
-    withoutComments.push(line);
-  }
-  const statements: string[] = [];
-  let current = "";
-  inDollar = false;
-  const parts = withoutComments.join("\n").split("$$");
-  // Even indices (0,2,4..) are outside dollar quotes; odd indices are bodies.
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i] as string;
-    if (i % 2 === 1) {
-      current += `$$${part}$$`;
-    } else {
-      for (const stmt of part.split(";")) {
-        const trimmed = (current + stmt).trim();
-        current = "";
-        if (trimmed !== "") statements.push(trimmed);
-      }
-    }
-  }
-  const tail = current.trim();
-  if (tail !== "") statements.push(tail);
-  return statements;
-}
 
 const { conn, close, label } = await connectPg();
 console.log(`pg-migrate: backend=${label}`);
