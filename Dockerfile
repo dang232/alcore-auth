@@ -18,6 +18,9 @@ RUN bun install --frozen-lockfile --production
 # Only the runtime tree enters the image (tests/ci/docs stay out;
 # see .dockerignore for the belt-and-suspenders exclusion list).
 COPY src ./src
+# Operator scripts ride along so the deploy can apply schema migrations from a
+# one-off container built from the same tree it is about to run.
+COPY scripts ./scripts
 
 ENV NODE_ENV=production
 

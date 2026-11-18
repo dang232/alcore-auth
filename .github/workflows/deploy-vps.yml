@@ -49,7 +49,15 @@ jobs:
             git reset --hard origin/main
             # Build on the VPS: no CI image exists for this service, so
             # --no-build/--pull never would pin production to a stale image.
-            timeout 10m docker compose up -d --build
+            # Schema migrations run BEFORE the new code serves traffic: a
+            # column the new code writes must exist first, and the one-off
+            # container below carries the freshly built tree. SQLite needs no
+            # step here — its guarded ALTER runs at import.
+            timeout 10m docker compose build
+            if grep -qE '^AUTH_STORE_BACKEND=postgres' .env 2>/dev/null; then
+              timeout 5m docker compose run --rm --no-deps auth bun run scripts/pg-migrate.ts
+            fi
+            timeout 10m docker compose up -d
             timeout 30s docker compose ps
             PORT=$(awk -F= '$1 == "AUTH_PORT" { print $2; exit }' .env 2>/dev/null || true)
             PORT=${PORT:-8082}
