@@ -113,7 +113,7 @@ describe("register + login", () => {
 });
 
 describe("refresh rotation + logout", () => {
-  test("refresh rotates; old refresh is rejected (reuse -> 401)", async () => {
+  test("refresh rotates; an immediately replayed refresh rotates again instead of revoking", async () => {
     await registerVerify("bob@example.com", "s3cret-pass");
     const login = await post("/auth/login", { email: "bob@example.com", password: "s3cret-pass" });
     expect(login.status).toBe(200);
@@ -122,8 +122,11 @@ describe("refresh rotation + logout", () => {
     expect(r1.status).toBe(200);
     const second = (await r1.json()) as { refresh_token: string };
     expect(second.refresh_token).not.toBe(first.refresh_token);
-    const reuse = await post("/auth/refresh", { refresh_token: first.refresh_token });
-    expect(reuse.status).toBe(401);
+    // Inside the grace window a replay is a client race, so it rotates again.
+    const replay = await post("/auth/refresh", { refresh_token: first.refresh_token });
+    expect(replay.status).toBe(200);
+    const replayed = (await replay.json()) as { refresh_token: string };
+    expect(replayed.refresh_token).not.toBe(first.refresh_token);
   });
 
   test("logout revokes the session (refresh rejected after)", async () => {

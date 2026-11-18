@@ -211,23 +211,34 @@ describe("login + exact cookie flags + generic errors", () => {
 });
 
 describe("refresh rotation + reuse family revoke + logout", () => {
-  test("reuse revokes the whole family and audits refresh_reuse", async () => {
+  test("reuse inside the grace window rotates; outside it revokes one session and audits", async () => {
     const first = await registerLogin("lh-reuse1@example.com", "s3cret-pass");
     const secondLogin = await post("/auth/login", { email: "lh-reuse1@example.com", password: "s3cret-pass" });
     const second = (await secondLogin.json()) as { refresh_token: string; access_token: string };
     const r1 = await post("/auth/refresh", { refresh_token: first.refresh_token });
     expect(r1.status).toBe(200);
-    const reuse = await post("/auth/refresh", { refresh_token: first.refresh_token });
-    expect(reuse.status).toBe(401);
-    expect(await reuse.json()).toEqual({ error: "invalid_grant" });
-    // Family revoke: the sibling session's refresh is dead too.
-    expect((await post("/auth/refresh", { refresh_token: second.refresh_token })).status).toBe(401);
-    // Revocation is enforced on session-bound surfaces. GET /auth/me stays a
-    // stateless JWT read by design (pinned by the rotation overlap suite: it
-    // must 200 for previous-key tokens), so the proof uses /auth/sessions.
-    expect((await authed("/auth/sessions", second.access_token)).status).toBe(401);
+    // A replay milliseconds after the rotation is the race a second holder or a
+    // force quit produces: it rotates again and stays audited as a grace pass.
+    const race = await post("/auth/refresh", { refresh_token: first.refresh_token });
+    expect(race.status).toBe(200);
+    const raced = (await race.json()) as { refresh_token: string };
     expect(saw("auth.refresh", "ok")).toBe(true);
-    expect(saw("auth.refresh_reuse", "invalid_grant")).toBe(true);
+    expect(saw("auth.refresh_grace", "ok")).toBe(true);
+
+    process.env["REFRESH_REUSE_GRACE_MS"] = "0";
+    try {
+      const live = await post("/auth/refresh", { refresh_token: raced.refresh_token });
+      expect(live.status).toBe(200);
+      const reuse = await post("/auth/refresh", { refresh_token: raced.refresh_token });
+      expect(reuse.status).toBe(401);
+      expect(await reuse.json()).toEqual({ error: "invalid_grant" });
+      // Only the replayed session dies: the sibling stays usable.
+      expect(saw("auth.refresh_reuse", "invalid_grant")).toBe(true);
+      expect((await post("/auth/refresh", { refresh_token: second.refresh_token })).status).toBe(200);
+      expect((await authed("/auth/sessions", second.access_token)).status).toBe(200);
+    } finally {
+      delete process.env["REFRESH_REUSE_GRACE_MS"];
+    }
   });
 
   test("logout revokes, clears cookies, and audits; bare logout 401s", async () => {

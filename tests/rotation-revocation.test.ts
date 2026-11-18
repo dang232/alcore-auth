@@ -259,32 +259,47 @@ describe("atomic refresh rotation", () => {
     expect((await sessionStore.findById(first.id))?.refreshHash).toBe(hashToken(`${TAG}-cas-second`));
   });
 
-  test("concurrent double-refresh yields exactly one winner; loser revokes family", async () => {
+  test("a concurrent refresh burst is a client race: it answers, it never revokes", async () => {
     const ip = freshIp();
     const user = await register(ip, `${TAG}-race@example.com`);
     const attempts = await Promise.all(
       Array.from({ length: 8 }, () => post("/auth/refresh", { refresh_token: user.refresh }, ip)),
     );
-    const won = attempts.filter((r) => r.status === 200);
-    const lost = attempts.filter((r) => r.status === 401);
-    expect(won.length).toBe(1);
-    expect(lost.length).toBe(7);
-    const winner = (await (won[0] as Response).json()) as { refresh_token: string };
-    expect(winner.refresh_token).not.toBe(user.refresh);
-    const after = await post("/auth/refresh", { refresh_token: winner.refresh_token }, ip);
-    expect(after.status).toBe(401);
+    expect(attempts.every((r) => r.status === 200 || r.status === 401)).toBe(true);
+    expect(attempts.some((r) => r.status === 200)).toBe(true);
+    // Every loser presented a token rotated milliseconds ago, so the family is
+    // still alive: the original value rotates again instead of revoking.
+    const again = await post("/auth/refresh", { refresh_token: user.refresh }, ip);
+    expect(again.status).toBe(200);
+    const fresh = (await again.json()) as { refresh_token: string };
+    expect(fresh.refresh_token).not.toBe(user.refresh);
+    expect((await post("/auth/refresh", { refresh_token: fresh.refresh_token }, ip)).status).toBe(200);
   });
 
-  test("reuse of an old refresh revokes the whole family", async () => {
+  test("reuse inside the grace window stays signed in; reuse after it revokes only that session", async () => {
     const ip = freshIp();
     await register(ip, `${TAG}-family@example.com`);
     const s1 = await login(ip, `${TAG}-family@example.com`);
     const s2 = await login(ip, `${TAG}-family@example.com`);
     const rotated = (await (await post("/auth/refresh", { refresh_token: s1.refresh }, ip)).json()) as { refresh_token: string };
     expect(rotated.refresh_token).not.toBe(s1.refresh);
-    expect((await post("/auth/refresh", { refresh_token: s1.refresh }, ip)).status).toBe(401);
-    expect((await post("/auth/refresh", { refresh_token: s2.refresh }, ip)).status).toBe(401);
-    expect((await post("/auth/refresh", { refresh_token: rotated.refresh_token }, ip)).status).toBe(401);
+    // Immediately re-presenting the rotated-out token is the race a force quit
+    // or a second holder produces: it rotates again, nothing is revoked.
+    const s1Live = (await (await post("/auth/refresh", { refresh_token: s1.refresh }, ip)).json()) as { refresh_token: string };
+    expect(s1Live.refresh_token).not.toBe(s1.refresh);
+    const s2Live = (await (await post("/auth/refresh", { refresh_token: s2.refresh }, ip)).json()) as { refresh_token: string };
+    expect(s2Live.refresh_token).not.toBe(s2.refresh);
+
+    // Outside the window the same presentation is theft: that session dies.
+    process.env["REFRESH_REUSE_GRACE_MS"] = "0";
+    try {
+      expect((await post("/auth/refresh", { refresh_token: s1.refresh }, ip)).status).toBe(401);
+      expect((await post("/auth/refresh", { refresh_token: s1Live.refresh_token }, ip)).status).toBe(401);
+      // One stale presentation no longer signs the user out of every device.
+      expect((await post("/auth/refresh", { refresh_token: s2Live.refresh_token }, ip)).status).toBe(200);
+    } finally {
+      delete process.env["REFRESH_REUSE_GRACE_MS"];
+    }
   });
 });
 

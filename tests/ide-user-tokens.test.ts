@@ -290,23 +290,39 @@ describe("POST /auth/token/refresh", () => {
     expect(second.status).toBe(200);
   });
 
-  test("reuse of a rotated-out refresh revokes the family (new refresh dies too)", async () => {
+  test("reuse inside the grace window keeps the family alive", async () => {
     const { userToken } = await desktopLogin();
     const first = await post("/auth/token/refresh", { refreshToken: userToken.refresh_token }, freshIp());
     expect(first.status).toBe(200);
     const rotated = (await first.json()) as UserTokenPairBody;
-    // Attacker replays the already-rotated refresh: reuse signal.
+    // A second holder presents the token that was rotated microseconds ago:
+    // a race over one single-use value, so the family rotates again.
     const replay = await post("/auth/token/refresh", { refreshToken: userToken.refresh_token }, freshIp());
-    expect(replay.status).toBe(401);
-    expect(await replay.json()).toEqual({ error: "invalid_grant" });
-    // The honest holder's newest refresh is now dead: family revoked.
-    const after = await post("/auth/token/refresh", { refreshToken: rotated.refresh_token }, freshIp());
-    expect(after.status).toBe(401);
-    expect(await after.json()).toEqual({ error: "invalid_grant" });
-    // Sibling families for the same user are untouched: a second login still rotates.
-    const secondLogin = await desktopLogin();
-    const ok = await post("/auth/token/refresh", { refreshToken: secondLogin.userToken.refresh_token }, freshIp());
-    expect(ok.status).toBe(200);
+    expect(replay.status).toBe(200);
+    const replayPair = (await replay.json()) as UserTokenPairBody;
+    expect(replayPair.refresh_token).not.toBe(userToken.refresh_token);
+    // The first holder's pair is still accepted: nothing was revoked.
+    expect((await post("/auth/token/refresh", { refreshToken: rotated.refresh_token }, freshIp())).status).toBe(200);
+  });
+
+  test("reuse after the grace window revokes that family and no sibling", async () => {
+    process.env["REFRESH_REUSE_GRACE_MS"] = "0";
+    try {
+      const { userToken } = await desktopLogin();
+      const first = await post("/auth/token/refresh", { refreshToken: userToken.refresh_token }, freshIp());
+      expect(first.status).toBe(200);
+      const live = (await first.json()) as UserTokenPairBody;
+      const stolen = await post("/auth/token/refresh", { refreshToken: userToken.refresh_token }, freshIp());
+      expect(stolen.status).toBe(401);
+      expect(await stolen.json()).toEqual({ error: "invalid_grant" });
+      // The honest holder's newest pair dies with the family.
+      expect((await post("/auth/token/refresh", { refreshToken: live.refresh_token }, freshIp())).status).toBe(401);
+      // A sibling family for the same user is untouched.
+      const secondLogin = await desktopLogin();
+      expect((await post("/auth/token/refresh", { refreshToken: secondLogin.userToken.refresh_token }, freshIp())).status).toBe(200);
+    } finally {
+      delete process.env["REFRESH_REUSE_GRACE_MS"];
+    }
   });
 
   test("malformed input answers 401 invalid_grant, never 500", async () => {

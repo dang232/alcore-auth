@@ -103,9 +103,12 @@ describe("F0 postgres: register/login/refresh/reuse/logout", () => {
     expect(r1.status).toBe(200);
     const second = (await r1.json()) as { refresh_token: string };
     expect(second.refresh_token).not.toBe(pair.refresh_token);
-    expect((await post("/auth/refresh", { refresh_token: pair.refresh_token })).status).toBe(401);
-    expect((await post("/auth/logout", { refresh_token: second.refresh_token })).status).toBe(200);
-    expect((await post("/auth/refresh", { refresh_token: second.refresh_token })).status).toBe(401);
+    // A replay inside the grace window is a client race: it rotates, no revoke.
+    const replay = await post("/auth/refresh", { refresh_token: pair.refresh_token });
+    expect(replay.status).toBe(200);
+    const replayed = (await replay.json()) as { refresh_token: string };
+    expect((await post("/auth/logout", { refresh_token: replayed.refresh_token })).status).toBe(200);
+    expect((await post("/auth/refresh", { refresh_token: replayed.refresh_token })).status).toBe(401);
   });
 });
 

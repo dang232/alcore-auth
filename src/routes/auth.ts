@@ -31,6 +31,7 @@ import { verifyPasswordCompat } from "../lib/legacy-password";
 import { emitAudit } from "../lib/audit";
 import { GoogleCredentialError, GoogleUpstreamError, verifyGoogleCredential, type VerifiedGoogleProfile } from "../lib/google";
 import type { Session } from "../lib/store";
+import type { IdeRefreshRecord } from "../lib/auth-models";
 import { limitedAsync as throttleGuard } from "../lib/ratelimit";
 import { deliverPurposeMail } from "../lib/mail";
 import { issueSignupOtp, sendSignupOtp, verifySignupOtp } from "../lib/otp";
@@ -43,6 +44,17 @@ export const REFRESH_TTL_MS = 30 * 24 * 3600 * 1000; // rotating refresh (30 d)
 export const IDE_ACCESS_TTL_SECONDS = USER_TOKEN_TTL_SECONDS;
 export const IDE_REFRESH_TTL_MS = 30 * 24 * 3600 * 1000;
 export const IDE_DESKTOP_SCOPES: readonly UserTokenScope[] = USER_TOKEN_SCOPES;
+// A rotated-out refresh token presented inside this window is a client race
+// over one single-use token (two holders of the same store, or a process killed
+// between the rotation and its persist), not theft: the family rotates again
+// and stays alive. Outside it, reuse revokes as before.
+export const REFRESH_REUSE_GRACE_MS = 90_000;
+export const refreshReuseGraceMs = (): number => {
+  const raw = process.env["REFRESH_REUSE_GRACE_MS"];
+  if (raw === undefined || raw.trim() === "") return REFRESH_REUSE_GRACE_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : REFRESH_REUSE_GRACE_MS;
+};
 const VERIFY_TTL_SECONDS = 24 * 3600;
 const RESET_TTL_SECONDS = 3600;
 
@@ -546,12 +558,39 @@ authRoutes.post("/refresh", async (c) => {
       return c.json(pair);
     }
   }
-  // Lost the rotation race, or presented an already-rotated token: either way
-  // the digest is now a reuse signal — revoke the whole family (theft signal).
+  // Lost the rotation race, or presented an already-rotated token.
   const reuse = await sessionStore.findByRefreshOrPrevHash(digest);
-  if (reuse !== undefined && sessionStore.isReusedHash(reuse, digest)) {
-    await sessionStore.revokeAllForUser(reuse.userId);
-    emitAudit("auth.refresh_reuse", "invalid_grant", { userId: reuse.userId, ip: clientIp(c) });
+  if (
+    reuse !== undefined &&
+    !reuse.revoked &&
+    reuse.expiresAt > Date.now() &&
+    sessionStore.isReusedHash(reuse, digest)
+  ) {
+    if (Date.now() - (reuse.rotatedAt ?? 0) < refreshReuseGraceMs()) {
+      const next = randomToken(32);
+      if (await sessionStore.rotate(reuse, hashToken(next))) {
+        const keys = getJwtRotationKeys();
+        const access = signAccess(
+          { sub: reuse.userId, sid: reuse.id, iss: getIssuer(), aud: "auth", intent: "session" },
+          keys.current,
+          ACCESS_TTL_SECONDS,
+          { kid: keys.currentKid },
+        );
+        const pair: TokenPair = {
+          access_token: access,
+          refresh_token: next,
+          token_type: "Bearer",
+          expires_in: ACCESS_TTL_SECONDS,
+        };
+        setAuthCookies(c, pair);
+        emitAudit("auth.refresh_grace", "ok", { userId: reuse.userId, ip: clientIp(c) });
+        return c.json(pair);
+      }
+    } else {
+      await sessionStore.revoke(reuse);
+      emitAudit("auth.refresh_reuse", "invalid_grant", { userId: reuse.userId, ip: clientIp(c) });
+      return c.json({ error: "invalid_grant" }, 401);
+    }
   } else {
     emitAudit("auth.refresh", "invalid_grant", { ip: clientIp(c) });
   }
@@ -560,11 +599,36 @@ authRoutes.post("/refresh", async (c) => {
 
 // POST /auth/token/refresh — user-scoped IDE pair rotation (project-ide
 // task 38). Body { refreshToken } (also accepts snake_case refresh_token): single-use opaque refresh, stored hashed
-// with ~30 d expiry; rotation mints a fresh pair with the family's scopes and
-// reuse of a rotated-out token revokes the whole family (theft signal).
-// Every failure — missing/malformed/unknown/expired/reused — answers the
-// identical 401 { error: "invalid_grant" } (never 500, no oracle). Session
-// refresh tokens live in a different table and never validate here.
+// with ~30 d expiry; rotation mints a fresh pair with the family's scopes.
+// Reuse of a rotated-out token inside the grace window answers like a normal
+// rotation for that family; outside it, reuse revokes the whole family as a
+// theft signal. Every failure — missing/malformed/unknown/expired/reused —
+// answers the identical 401 { error: "invalid_grant" } (never 500, no oracle).
+// Session refresh tokens live in a different table and never validate here.
+const userTokenScopeSet = new Set<string>(USER_TOKEN_SCOPES);
+
+// `scopes` is the family's stored least-privilege set; the route validates it
+// with isValidUserTokenScopeSet before minting, and this narrows the same values
+// to the type the pair carries.
+const asUserTokenScopes = (scopes: readonly string[]): UserTokenScope[] =>
+  scopes.filter((scope): scope is UserTokenScope => userTokenScopeSet.has(scope));
+
+const mintUserPair = (record: IdeRefreshRecord, refreshToken: string): UserTokenPair => {
+  const keys = getJwtRotationKeys();
+  return {
+    access_token: signUserToken(
+      { sub: record.userId, scope: record.scopes, iss: getIssuer() },
+      keys.current,
+      IDE_ACCESS_TTL_SECONDS,
+      { kid: keys.currentKid },
+    ),
+    refresh_token: refreshToken,
+    token_type: "Bearer",
+    expires_in: IDE_ACCESS_TTL_SECONDS,
+    scope: asUserTokenScopes(record.scopes),
+  };
+};
+
 authRoutes.post("/token/refresh", async (c) => {
   const gateUserRefresh = await limitedAsync(c, "refresh");
   if (gateUserRefresh !== null) return gateUserRefresh;
@@ -585,30 +649,29 @@ authRoutes.post("/token/refresh", async (c) => {
   ) {
     const next = randomToken(32);
     if (await ideRefreshStore.rotate(record, hashToken(next))) {
-      const keys = getJwtRotationKeys();
-      const access = signUserToken(
-        { sub: record.userId, scope: record.scopes, iss: getIssuer() },
-        keys.current,
-        IDE_ACCESS_TTL_SECONDS,
-        { kid: keys.currentKid },
-      );
-      const rotated: UserTokenPair = {
-        access_token: access,
-        refresh_token: next,
-        token_type: "Bearer",
-        expires_in: IDE_ACCESS_TTL_SECONDS,
-        scope: [...record.scopes],
-      };
       emitAudit("auth.user_token_refresh", "ok", { userId: record.userId, ip: clientIp(c) });
-      return c.json(rotated);
+      return c.json(mintUserPair(record, next));
     }
   }
-  // Lost the rotation race, or presented an already-rotated token: either
-  // way the digest is now a reuse signal — revoke the whole family.
+  // Lost the rotation race, or presented an already-rotated token.
   const reuse = await ideRefreshStore.findByTokenOrPrevHash(digest);
-  if (reuse !== undefined && ideRefreshStore.isReusedHash(reuse, digest)) {
-    await ideRefreshStore.revokeFamily(reuse.familyId);
-    emitAudit("auth.user_token_refresh_reuse", "invalid_grant", { userId: reuse.userId, ip: clientIp(c) });
+  if (
+    reuse !== undefined &&
+    !reuse.revoked &&
+    reuse.expiresAt > Date.now() &&
+    ideRefreshStore.isReusedHash(reuse, digest)
+  ) {
+    if (Date.now() - (reuse.rotatedAt ?? 0) < refreshReuseGraceMs()) {
+      const next = randomToken(32);
+      if (await ideRefreshStore.rotate(reuse, hashToken(next))) {
+        emitAudit("auth.user_token_refresh_grace", "ok", { userId: reuse.userId, ip: clientIp(c) });
+        return c.json(mintUserPair(reuse, next));
+      }
+    } else {
+      await ideRefreshStore.revokeFamily(reuse.familyId);
+      emitAudit("auth.user_token_refresh_reuse", "invalid_grant", { userId: reuse.userId, ip: clientIp(c) });
+      return c.json({ error: "invalid_grant" }, 401);
+    }
   } else {
     emitAudit("auth.user_token_refresh", "invalid_grant", { ip: clientIp(c) });
   }

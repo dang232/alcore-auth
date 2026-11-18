@@ -43,7 +43,7 @@ calls out) for customer provision/backfill/link.
 | GET | `/health/ready` | readiness: config + store + signer checks (503 + reasons when down) |
 | POST | `/auth/register` | 201 `{id, email, emailVerified}`; dup → 409 `email_taken` |
 | POST | `/auth/login` | 200 + HttpOnly cookies; wrong credential → identical 401 |
-| POST | `/auth/refresh` | rotation; reuse = theft signal → session revoked |
+| POST | `/auth/refresh` | rotation; reuse inside the 90 s grace window rotates again, outside it revokes that session (never the user's other devices) |
 | POST | `/auth/logout` | clears cookies, revokes session |
 | GET | `/auth/me` | current user |
 | POST | `/auth/verify/request` `/auth/verify/consume` | email verification (always-200 request) |
@@ -57,6 +57,13 @@ calls out) for customer provision/backfill/link.
 Configure OIDC clients with `AUTH_OIDC_CLIENTS=client_id=https://exact/callback`
 (comma-separated entries); both `client_id` and exact `redirect_uri` must match.
 `AUTH_ALLOWED_ORIGINS` remains an additional origin-level restriction.
+
+`REFRESH_REUSE_GRACE_MS` (default `90000`, `0` disables) is the window in which
+presenting a rotated-out refresh token rotates again instead of revoking. It
+exists because a client race over one single-use token is indistinguishable from
+theft by value alone; the rotation timestamp now tells them apart. Outside the
+window a reused token revokes its family: the whole IDE pair family for
+`/auth/token/refresh`, and only the replayed session for `/auth/refresh`.
 
 Product exchange: the authenticated caller requests `audience` (`tokenpanel` or
 `libre`) and `intent` (`product_exchange`). The returned opaque code expires in
