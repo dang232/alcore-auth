@@ -522,8 +522,18 @@ authRoutes.post("/login", async (c) => {
   }
   const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
+  // User-scoped IDE pair for desktop clients (keychain storage), the same
+  // desktop scope set the Google desktop-code completion issues.
+  // `user_access_token` is the field Alcode reads first; `user_token` keeps
+  // the Google completion shape. Session pair, cookies, TTLs unchanged.
+  const userToken = await issueUserTokenPair(user.id, IDE_DESKTOP_SCOPES);
   emitAudit("auth.login", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: user.emailVerified } });
+  return c.json({
+    ...pair,
+    user_token: userToken,
+    user_access_token: userToken.access_token,
+    user: { id: user.id, email: user.email, emailVerified: user.emailVerified },
+  });
 });
 
 // POST /auth/refresh — atomic single-use rotation; reuse → family revoke + 401.
@@ -970,8 +980,16 @@ authRoutes.post("/verify-otp", async (c) => {
   await userStore.setVerified(user.id);
   const { pair } = await issuePair(user.id);
   setAuthCookies(c, pair);
+  // Same additive IDE pair as POST /auth/login: OTP completion is the other
+  // path that finishes an email login. Session pair, cookies, TTLs unchanged.
+  const userToken = await issueUserTokenPair(user.id, IDE_DESKTOP_SCOPES);
   emitAudit("auth.verify_otp", "ok", { userId: user.id, ip: clientIp(c) });
-  return c.json({ ...pair, user: { id: user.id, email: user.email, emailVerified: true } });
+  return c.json({
+    ...pair,
+    user_token: userToken,
+    user_access_token: userToken.access_token,
+    user: { id: user.id, email: user.email, emailVerified: true },
+  });
 });
 
 // POST /auth/otp-resend — re-issue a signup OTP respecting the lib cooldown.

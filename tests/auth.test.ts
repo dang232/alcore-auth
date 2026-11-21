@@ -10,9 +10,19 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
 import { app } from "../src/index";
 import { getJwtRotationKeys, getJwtSecret } from "../src/config";
-import { mintPurposeToken, signAccess, verifyAccess } from "../src/lib/crypto";
+import {
+  USER_TOKEN_AUDIENCE,
+  USER_TOKEN_INTENT,
+  hashToken,
+  mintPurposeToken,
+  signAccess,
+  verifyAccess,
+  verifyUserToken,
+} from "../src/lib/crypto";
 import { createRateLimiter, resetRateLimitsForTests, resetThrottleConnForTests } from "../src/lib/ratelimit";
-import { googleStateStore, resetStoresForTests, userStore } from "../src/lib/store";
+import { googleStateStore, ideRefreshStore, resetStoresForTests, userStore } from "../src/lib/store";
+import { clearAuditForTests, listAuditForTests } from "../src/lib/audit";
+import { IDE_DESKTOP_SCOPES } from "../src/routes/auth";
 import { getIssuer } from "../src/config";
 import { resetSignupOtpsForTests } from "../src/lib/otp";
 import { resetMailSender, setMailSender, type MailMessage } from "../src/lib/mail";
@@ -683,5 +693,224 @@ describe("change password (POST /auth/change)", () => {
     const bogus = await change("not-a-token", { currentPassword: "x", newPassword: "new-pass-456" });
     expect(bogus.status).toBe(401);
     expect(await bogus.json()).toEqual({ error: "unauthorized" });
+  });
+});
+
+// Email/OTP login must hand the client the same user-scoped IDE pair the
+// Google desktop-code completion already returns. Alcode's desktop auth
+// captures user_access_token (it reads that field before access_token) and
+// keeps the IDE refresh from user_token; before this change an email login
+// stored the session token, which the Alcore catalog refuses (ALCORE_REJECTED).
+// The session pair, its cookies, and its TTLs are asserted unchanged below.
+describe("email login IDE token parity", () => {
+  const DESKTOP_SCOPES = ["profile:read", "quota:read", "tier:read", "models:read", "subscription:read", "usage:read", "chat:write"] as const;
+
+  interface IdePairBody {
+    access_token: string;
+    refresh_token: string;
+    token_type: string;
+    expires_in: number;
+    scope: string[];
+  }
+
+  interface EmailLoginBody {
+    access_token: string;
+    refresh_token: string;
+    token_type: string;
+    expires_in: number;
+    user_token: IdePairBody;
+    user_access_token: string;
+    user: { id: string; email: string; emailVerified: boolean };
+  }
+
+  function expectEmailLoginPair(body: EmailLoginBody, expectedSub: string): void {
+    // Wire order: the session pair first (unchanged), then the additive IDE
+    // pair and the user view.
+    expect(Object.keys(body)).toEqual([
+      "access_token",
+      "refresh_token",
+      "token_type",
+      "expires_in",
+      "user_token",
+      "user_access_token",
+      "user",
+    ]);
+    expect(body.token_type).toBe("Bearer");
+    expect(body.expires_in).toBe(900);
+    expect(body.user_access_token).toBe(body.user_token.access_token);
+    // Scoped exactly like the Google desktop completion issues it.
+    expect(body.user_token.scope).toEqual([...DESKTOP_SCOPES]);
+    expect(body.user_token.scope).toEqual([...IDE_DESKTOP_SCOPES]);
+    expect(body.user_token.token_type).toBe("Bearer");
+    expect(body.user_token.expires_in).toBe(600);
+    expect(/^[0-9a-f]{64}$/.test(body.user_token.refresh_token)).toBe(true);
+    const payload = verifyUserToken(body.user_token.access_token, getJwtRotationKeys(), getIssuer());
+    expect(payload.sub).toBe(expectedSub);
+    expect(payload.sub).toBe(body.user.id);
+    expect(payload.scope).toEqual([...DESKTOP_SCOPES]);
+    expect(typeof payload.jti).toBe("string");
+    expect(payload.jti.length).toBeGreaterThan(0);
+    expect(payload.aud).toBe(USER_TOKEN_AUDIENCE);
+    expect(payload.intent).toBe(USER_TOKEN_INTENT);
+    expect(payload.exp - payload.iat).toBe(600);
+    // The session access token stayed a session token: this is the token the
+    // catalog refused before the fix.
+    expect(() => verifyUserToken(body.access_token, getJwtRotationKeys(), getIssuer())).toThrow();
+  }
+
+  test("POST /auth/login returns a sub-scoped IDE pair with the desktop scope set", async () => {
+    await registerVerify("ide-login@example.com", "s3cret-pass");
+    const res = await post("/auth/login", { email: "ide-login@example.com", password: "s3cret-pass" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as EmailLoginBody;
+    const user = await userStore.findByEmail("ide-login@example.com");
+    const id = user === undefined ? "missing-user" : user.id;
+    expectEmailLoginPair(body, id);
+    const cookies = res.headers.getSetCookie();
+    expect(cookies.some((v) => v.startsWith("alcore_at=") && v.includes("HttpOnly"))).toBe(true);
+    expect(cookies.some((v) => v.startsWith("alcore_rt="))).toBe(true);
+    expect((await authed("/auth/me", body.access_token)).status).toBe(200);
+    // The nested refresh is a real IDE family: stored hashed, single-use.
+    const stored = await ideRefreshStore.findByTokenHash(hashToken(body.user_token.refresh_token));
+    expect(stored?.userId).toBe(id);
+    expect(stored?.scopes).toEqual([...DESKTOP_SCOPES]);
+    const rotated = await post("/auth/token/refresh", { refresh_token: body.user_token.refresh_token });
+    expect(rotated.status).toBe(200);
+    const next = (await rotated.json()) as IdePairBody;
+    expect(next.scope).toEqual([...DESKTOP_SCOPES]);
+    expect(next.refresh_token).not.toBe(body.user_token.refresh_token);
+    // The top-level session refresh still rotates in the session family.
+    expect((await post("/auth/refresh", { refresh_token: body.refresh_token })).status).toBe(200);
+    // The existing audit emit is preserved and carries the linkage id only.
+    const audit = listAuditForTests().filter((row) => row.event === "auth.login" && row.userId === id);
+    expect(audit.map((row) => row.outcome)).toEqual(["ok"]);
+  });
+
+  test("the login IDE token verifies on the model catalog's token path", async () => {
+    await registerVerify("ide-catalog@example.com", "s3cret-pass");
+    const res = await post("/auth/login", { email: "ide-catalog@example.com", password: "s3cret-pass" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as EmailLoginBody;
+    // The Alcore model catalog (AlRepo apps/api, ide-catalog-user-auth) verifies
+    // this token with the shared rotation keys and requires aud=tokenpanel,
+    // intent=ide_read and models:read in scope. All three hold here.
+    const payload = verifyUserToken(body.user_access_token, getJwtRotationKeys(), getIssuer());
+    expect(payload.aud).toBe(USER_TOKEN_AUDIENCE);
+    expect(payload.intent).toBe(USER_TOKEN_INTENT);
+    expect(payload.scope).toContain("models:read");
+    expect(payload.sub).toBe(body.user.id);
+    // It is not a session assertion: the two families stay separate.
+    expect(() => verifyAccess(body.user_access_token, getJwtRotationKeys(), getIssuer(), "auth", "session")).toThrow();
+  });
+
+  test("POST /auth/verify-otp returns the identical IDE pair", async () => {
+    const reg = await post("/auth/register", { email: "ide-otp@example.com", password: "s3cret-pass" });
+    expect(reg.status).toBe(202);
+    const code = mailedCode(sent.find((m) => m.to === "ide-otp@example.com") as MailMessage);
+    expect(code).toMatch(/^\d{6}$/);
+    const res = await post("/auth/verify-otp", { email: "ide-otp@example.com", code });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as EmailLoginBody;
+    const user = await userStore.findByEmail("ide-otp@example.com");
+    const id = user === undefined ? "missing-user" : user.id;
+    expectEmailLoginPair(body, id);
+    expect(body.user.emailVerified).toBe(true);
+    const audit = listAuditForTests().filter((row) => row.event === "auth.verify_otp" && row.userId === id);
+    expect(audit.map((row) => row.outcome)).toEqual(["ok"]);
+  });
+
+  test("a failed login keeps the single 401 shape and issues no tokens", async () => {
+    await registerVerify("ide-fail@example.com", "s3cret-pass");
+    clearAuditForTests();
+    const res = await post("/auth/login", { email: "ide-fail@example.com", password: "wrong-pass" });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "invalid_credentials" });
+    const cookies = res.headers.getSetCookie();
+    expect(cookies.some((v) => v.startsWith("alcore_at="))).toBe(false);
+    expect(cookies.some((v) => v.startsWith("alcore_rt="))).toBe(false);
+    expect(listAuditForTests().map((row) => row.event + ":" + row.outcome)).toEqual(["auth.login_failed:invalid_credentials"]);
+  });
+
+  test("regression guard: /auth/google/verify keeps its single-field body", async () => {
+    const oldClientId = process.env["GOOGLE_CLIENT_ID"];
+    process.env["GOOGLE_CLIENT_ID"] = TEST_GOOGLE_CLIENT_ID;
+    const rig = createGoogleTestRig();
+    const token = rig.mintIdToken(baseGoogleClaims({ sub: "google-verify-parity", email: "google-verify-parity@example.com" }));
+    const { restore } = rig.installFetch(token);
+    try {
+      const res = await post("/auth/google/verify", { idToken: token });
+      expect(res.status).toBe(200);
+      expect(Object.keys((await res.json()) as Record<string, unknown>)).toEqual(["access_token"]);
+    } finally {
+      restore();
+      if (oldClientId === undefined) delete process.env["GOOGLE_CLIENT_ID"];
+      else process.env["GOOGLE_CLIENT_ID"] = oldClientId;
+    }
+  });
+
+  test("regression guard: the Google desktop-code completion keeps its exact pair shape", async () => {
+    const oldClientId = process.env["GOOGLE_CLIENT_ID"];
+    const oldClientSecret = process.env["GOOGLE_CLIENT_SECRET"];
+    process.env["GOOGLE_CLIENT_ID"] = TEST_GOOGLE_CLIENT_ID;
+    process.env["GOOGLE_CLIENT_SECRET"] = "test-client-secret";
+    const rig = createGoogleTestRig();
+    const token = rig.mintIdToken(baseGoogleClaims({ sub: "google-ide-parity", email: "google-ide-parity@example.com" }));
+    const { restore } = rig.installFetch(token);
+    try {
+      const res = await post("/auth/google/desktop-code", {
+        code: "google-ide-parity-code",
+        redirect_uri: "http://127.0.0.1:57123/auth/desktop-google/callback",
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { access_token: string; refresh_token: string; user_token: IdePairBody };
+      expect(Object.keys(body)).toEqual(["access_token", "refresh_token", "user_token"]);
+      // Google pairs the IDE refresh at the top level; that stays untouched.
+      expect(body.refresh_token).toBe(body.user_token.refresh_token);
+      expect(body.user_token.scope).toEqual([...DESKTOP_SCOPES]);
+      expect(body).not.toHaveProperty("user_access_token");
+      const payload = verifyUserToken(body.user_token.access_token, getJwtRotationKeys(), getIssuer());
+      expect(payload.sub).toBe(verifyAccess(body.access_token, getJwtRotationKeys(), getIssuer(), "auth", "session").sub);
+    } finally {
+      restore();
+      if (oldClientId === undefined) delete process.env["GOOGLE_CLIENT_ID"];
+      else process.env["GOOGLE_CLIENT_ID"] = oldClientId;
+      if (oldClientSecret === undefined) delete process.env["GOOGLE_CLIENT_SECRET"];
+      else process.env["GOOGLE_CLIENT_SECRET"] = oldClientSecret;
+    }
+  });
+
+  test("the new issuance writes no token material to logs or the audit sink", async () => {
+    await registerVerify("ide-redact@example.com", "s3cret-pass");
+    clearAuditForTests();
+    const captured: string[] = [];
+    const capture = (...args: unknown[]): void => {
+      captured.push(args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "));
+    };
+    const original = { log: console.log, error: console.error, warn: console.warn, info: console.info };
+    console.log = capture;
+    console.error = capture;
+    console.warn = capture;
+    console.info = capture;
+    try {
+      const res = await post("/auth/login", { email: "ide-redact@example.com", password: "s3cret-pass" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as EmailLoginBody;
+      const secrets = [body.access_token, body.refresh_token, body.user_token.access_token, body.user_token.refresh_token];
+      for (const secret of secrets) expect(secret.length).toBeGreaterThan(0);
+      const printed = captured.join("\n");
+      for (const secret of secrets) expect(printed).not.toContain(secret);
+      const rows = listAuditForTests();
+      expect(rows.length).toBeGreaterThan(0);
+      const auditText = JSON.stringify(rows);
+      for (const secret of secrets) expect(auditText).not.toContain(secret);
+      for (const row of rows) {
+        expect(Object.keys(row).every((key) => ["event", "outcome", "userId", "clientId", "ip", "at"].includes(key))).toBe(true);
+      }
+    } finally {
+      console.log = original.log;
+      console.error = original.error;
+      console.warn = original.warn;
+      console.info = original.info;
+    }
   });
 });
